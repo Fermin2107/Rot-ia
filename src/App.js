@@ -19,8 +19,12 @@ import { fetchPotreroNdvi, ndviTier } from "./ndviApi";
 /*
   Supabase — esquema esperado por la app:
 
-  - Tabla campos: id, user_id (FK auth.users), name, lat, lng, zoom (default 14), created_at.
+  - Tabla campos: id, user_id (FK auth.users), name, lat, lng, zoom (default 14), created_at,
+    descanso_bases_dias jsonb null — días base del motor de descanso por tipo (ver mergeDescansoBasesDias).
     RLS: todas las filas visibles/mutables sólo si auth.uid() = user_id.
+
+    Migración opcional:
+      alter table campos add column if not exists descanso_bases_dias jsonb default null;
 
   - Tabla potreros: debe incluir user_id, campo_id (FK campos ON DELETE CASCADE), name, positions,
     tipo_pasto text null (festuca | raigras | campo_natural | verdeo | otro), created_at.
@@ -145,6 +149,9 @@ const CLICK_DEBOUNCE_MS = 280;
 const CAMPO_STORAGE_KEY = "rotia_campo_id";
 /** sessionStorage: no volver a mostrar el aviso de potreros listos en esta sesión. */
 const LISTOS_BANNER_SESSION_KEY = "rotia_listos_descanso_banner_dismissed";
+
+/** Clave en `campos.descanso_bases_dias` para potreros sin tipo_pasto / otro. */
+const DESCANSO_BASE_KEY_SIN_ESPECIFICAR = "sin_especificar";
 
 const aguadaMarkerIcon = L.divIcon({
   className: "rotia-aguada-m",
@@ -434,8 +441,6 @@ function formatEventoHistorialFecha(iso) {
   }
 }
 
-const DESCANSO_LISTO_MIN_DIAS = 60;
-
 /** Valores persistidos en potreros.tipo_pasto (text, opcional). */
 const TIPO_PASTO_IDS = {
   FESTUCA: "festuca",
@@ -452,6 +457,143 @@ const TIPOS_PASTO_OPTIONS = [
   { id: TIPO_PASTO_IDS.VERDEO, label: "Verdeo" },
   { id: TIPO_PASTO_IDS.OTRO, label: "Otro" },
 ];
+
+/** Defaults del motor de descanso (días); editables por campo en ⚙️. */
+const DEFAULT_DESCANSO_BASES_DIAS = {
+  [TIPO_PASTO_IDS.FESTUCA]: 75,
+  [TIPO_PASTO_IDS.RAIGRAS]: 52,
+  [TIPO_PASTO_IDS.CAMPO_NATURAL]: 105,
+  [TIPO_PASTO_IDS.VERDEO]: 37,
+  [DESCANSO_BASE_KEY_SIN_ESPECIFICAR]: 60,
+};
+
+/**
+ * Fusiona overrides de `campos.descanso_bases_dias` con defaults.
+ * @param {unknown} dbJson
+ * @returns {Record<string, number>}
+ */
+function mergeDescansoBasesDias(dbJson) {
+  const out = { ...DEFAULT_DESCANSO_BASES_DIAS };
+  if (dbJson && typeof dbJson === "object" && !Array.isArray(dbJson)) {
+    const o = /** @type {Record<string, unknown>} */ (dbJson);
+    for (const k of Object.keys(DEFAULT_DESCANSO_BASES_DIAS)) {
+      const v = Number(o[k]);
+      if (Number.isFinite(v) && v >= 1 && v <= 500) out[k] = v;
+    }
+  }
+  return out;
+}
+
+function baseDiasDescansoForTipo(tipoPasto, bases) {
+  if (tipoPasto && bases[tipoPasto] != null) return bases[tipoPasto];
+  return bases[DESCANSO_BASE_KEY_SIN_ESPECIFICAR];
+}
+
+/** Hemisferio sur: primavera sep–nov, verano seco dic–feb, otoño mar–may, invierno jun–ago. */
+function seasonMultiplierDescanso(date) {
+  const m = date.getMonth();
+  if (m === 8 || m === 9 || m === 10) return 0.7;
+  if (m === 11 || m === 0 || m === 1) return 1.3;
+  if (m >= 2 && m <= 4) return 0.9;
+  return 1.1;
+}
+
+/**
+ * @typedef {{ kind: "sin_datos" }} MotorDescansoSinDatos
+ * @typedef {{ kind: "en_uso" }} MotorDescansoEnUso
+ * @typedef {{
+ *   kind: "descanso",
+ *   listo: boolean,
+ *   diasTranscurridos: number,
+ *   diasNecesarios: number,
+ *   diasRestantes: number,
+ *   primaryLine: string,
+ * }} MotorDescansoOk
+ * @typedef {MotorDescansoSinDatos | MotorDescansoEnUso | MotorDescansoOk} MotorDescanso
+ */
+
+/**
+ * Bloque E — motor de descanso (días necesarios vs transcurridos).
+ * @param {{
+ *   tipoPasto: string | null,
+ *   ultimoMovimiento: { fecha: string, direccion?: string } | null | undefined,
+ *   lluviaMm30d: number,
+ *   pastoreoCabezasUltima: number | null | undefined,
+ *   basesDias: Record<string, number>,
+ *   today?: Date,
+ * }} p
+ * @returns {MotorDescanso}
+ */
+function computeDescansoInteligente(p) {
+  const st = descansoFromUltimoMovimiento(p.ultimoMovimiento);
+  if (st.kind === "sin_datos") {
+    return { kind: "sin_datos" };
+  }
+  if (st.kind === "en_uso") {
+    return { kind: "en_uso" };
+  }
+  const elapsed = st.days;
+  const salidaDate = new Date(p.ultimoMovimiento.fecha);
+  const base = baseDiasDescansoForTipo(p.tipoPasto, p.basesDias);
+  let afterEpoca = base * seasonMultiplierDescanso(salidaDate);
+  const rainStep = Math.floor(Math.max(0, p.lluviaMm30d) / 10);
+  const maxRainOff = afterEpoca * 0.2;
+  const rainOff = Math.min(rainStep, maxRainOff);
+  let needed = afterEpoca - rainOff;
+  const heads = p.pastoreoCabezasUltima;
+  if (heads != null && Number.isFinite(heads) && heads > 100) {
+    needed *= 1.15;
+  }
+  needed = Math.max(1, Math.ceil(needed));
+  const remaining = Math.max(0, needed - elapsed);
+  const today = p.today ?? new Date();
+  if (remaining <= 0) {
+    return {
+      kind: "descanso",
+      listo: true,
+      diasTranscurridos: elapsed,
+      diasNecesarios: needed,
+      diasRestantes: 0,
+      primaryLine: "Listo para entrar",
+    };
+  }
+  const fechaListo = new Date(today);
+  fechaListo.setHours(12, 0, 0, 0);
+  fechaListo.setDate(fechaListo.getDate() + remaining);
+  const ddmm = fechaListo.toLocaleDateString("es-AR", {
+    day: "2-digit",
+    month: "2-digit",
+  });
+  const primaryLine = `Listo en ${remaining} ${remaining === 1 ? "día" : "días"} · ${ddmm}`;
+  return {
+    kind: "descanso",
+    listo: false,
+    diasTranscurridos: elapsed,
+    diasNecesarios: needed,
+    diasRestantes: remaining,
+    primaryLine,
+  };
+}
+
+/**
+ * Última entrada con fecha estrictamente anterior a la última salida (misma salida que cierra el pastoreo).
+ * @param {Array<{ fecha: string, datos?: { direccion?: string, cantidad?: unknown } }>} movRowsDesc
+ */
+function pastoreoCabezasUltimaAntesDeSalida(movRowsDesc) {
+  if (!movRowsDesc?.length) return null;
+  const first = movRowsDesc[0];
+  if (first.datos?.direccion !== "salida") return null;
+  const tSalida = new Date(first.fecha).getTime();
+  for (let i = 1; i < movRowsDesc.length; i++) {
+    const r = movRowsDesc[i];
+    if (new Date(r.fecha).getTime() >= tSalida) continue;
+    if (r.datos?.direccion === "entrada") {
+      const c = Number(r.datos?.cantidad);
+      return Number.isFinite(c) ? c : null;
+    }
+  }
+  return null;
+}
 
 function labelTipoPasto(tipoPasto) {
   if (!tipoPasto) return null;
@@ -723,69 +865,58 @@ function PlanificarRotacionModal({ open, onClose, potreros, ndviById }) {
 }
 
 /**
- * Bloque 3: NDVI + descanso (última salida) + contexto de lluvia en copy.
+ * Badge mapa / copy: prioriza motor de descanso (Bloque E); NDVI como refuerzo visual.
  * @returns {{ tier: "listo"|"casi"|"recup", label: string, mapShort: string, hint?: string }}
  */
-function recomendacionRotacion(ndviEntry, descansoState) {
+function recomendacionRotacion(ndviEntry, motor) {
   const ndvi = ndviEntry?.status === "ok" ? ndviEntry.meanNdvi : null;
-  const desc = descansoState;
-  const descDias = desc.kind === "descanso" ? desc.days : null;
 
-  if (
-    ndvi !== null &&
-    ndvi > 0.5 &&
-    desc.kind === "descanso" &&
-    descDias !== null &&
-    descDias > 60
-  ) {
-    return { tier: "listo", label: "Listo para entrar", mapShort: "Listo" };
+  if (!motor || motor.kind === "sin_datos") {
+    return {
+      tier: "casi",
+      label: "Sin datos",
+      mapShort: "—",
+      hint: "Registrá movimientos de hacienda para calcular el descanso.",
+    };
   }
-
-  if (desc.kind === "en_uso") {
+  if (motor.kind === "en_uso") {
     return {
       tier: "recup",
-      label: "En recuperación",
-      mapShort: "Recup.",
+      label: "Con hacienda",
+      mapShort: "Hac.",
       hint: "Hay hacienda en el potrero.",
     };
   }
-
-  if (ndvi !== null && ndvi < 0.3) {
-    return { tier: "recup", label: "En recuperación", mapShort: "Recup." };
+  if (motor.listo) {
+    return { tier: "listo", label: "Listo para entrar", mapShort: "Listo" };
   }
 
-  if (desc.kind === "descanso" && descDias !== null && descDias < 45) {
-    return { tier: "recup", label: "En recuperación", mapShort: "Recup." };
-  }
+  const n = motor.diasNecesarios ?? 1;
+  const r = motor.diasRestantes ?? 1;
+  const umbralCasi = Math.max(1, Math.ceil(n * 0.12));
 
-  if (ndvi !== null && ndvi >= 0.3 && ndvi <= 0.5) {
-    return { tier: "casi", label: "Casi listo", mapShort: "Casi" };
-  }
-
-  if (desc.kind === "descanso" && descDias !== null && descDias >= 45 && descDias <= 60) {
-    return { tier: "casi", label: "Casi listo", mapShort: "Casi" };
-  }
-
-  if (
-    ndvi !== null &&
-    ndvi > 0.5 &&
-    desc.kind === "descanso" &&
-    descDias !== null &&
-    descDias <= 60
-  ) {
-    return { tier: "casi", label: "Casi listo", mapShort: "Casi" };
-  }
-
-  if (desc.kind === "sin_datos") {
+  if (r <= umbralCasi) {
     return {
       tier: "casi",
       label: "Casi listo",
       mapShort: "Casi",
-      hint: "Registrá movimientos de hacienda para calcular el descanso.",
+      hint: motor.primaryLine,
     };
   }
-
-  return { tier: "casi", label: "Casi listo", mapShort: "Casi" };
+  if (ndvi !== null && ndvi < 0.28) {
+    return {
+      tier: "recup",
+      label: "En recuperación",
+      mapShort: "Recup.",
+      hint: motor.primaryLine,
+    };
+  }
+  return {
+    tier: "recup",
+    label: "En recuperación",
+    mapShort: "Recup.",
+    hint: motor.primaryLine,
+  };
 }
 
 function formatUltimaLluviaLine(ultimoLluvia) {
@@ -984,6 +1115,9 @@ function PrimerCampoModal({
   const [busy, setBusy] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
+  const [descansoBasesForm, setDescansoBasesForm] = useState(() => ({
+    ...DEFAULT_DESCANSO_BASES_DIAS,
+  }));
 
   useEffect(() => {
     if (!open) {
@@ -993,6 +1127,7 @@ function PrimerCampoModal({
       setError(null);
       setBusy(false);
       setSaving(false);
+      setDescansoBasesForm({ ...DEFAULT_DESCANSO_BASES_DIAS });
       return;
     }
     if (variant === "edit" && editingCampo) {
@@ -1003,6 +1138,7 @@ function PrimerCampoModal({
         lng: Number(editingCampo.lng),
         label: null,
       });
+      setDescansoBasesForm(mergeDescansoBasesDias(editingCampo.descanso_bases_dias));
       setError(null);
       return;
     }
@@ -1055,7 +1191,13 @@ function PrimerCampoModal({
         const zoom = preview?.searched ? 14 : (Number(editingCampo.zoom) || 14);
         const { data, error: updErr } = await supabase
           .from("campos")
-          .update({ name: n, lat, lng, zoom })
+          .update({
+            name: n,
+            lat,
+            lng,
+            zoom,
+            descanso_bases_dias: descansoBasesForm,
+          })
           .eq("id", editingCampo.id)
           .select()
           .single();
@@ -1204,6 +1346,41 @@ function PrimerCampoModal({
             Ubicación guardada del campo. Usá “Ir” arriba para buscar otra y recentrar.
           </p>
         )}
+        {variant === "edit" && (
+          <details style={{ marginTop: "14px" }}>
+            <summary style={{ cursor: "pointer", fontWeight: 700, color: "#355c3b", fontSize: "14px" }}>
+              Días base de descanso (motor inteligente)
+            </summary>
+            <p style={{ ...styles.primerCampoHint, marginTop: "8px", marginBottom: "10px" }}>
+              Se aplican según el tipo de pasto de cada potrero (Festuca, Raigrás, etc.). Valores por defecto del sector; ajustalos a tu manejo.
+            </p>
+            <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+              {[
+                ...TIPOS_PASTO_OPTIONS,
+                { id: DESCANSO_BASE_KEY_SIN_ESPECIFICAR, label: "Sin especificar" },
+              ].map(({ id, label }) => (
+                <label key={id} style={{ display: "block", fontSize: "13px", fontWeight: 600, color: "#2a3f2f" }}>
+                  {label}
+                  <input
+                    type="number"
+                    min={1}
+                    max={500}
+                    step={1}
+                    style={{ ...styles.primerCampoInput, marginTop: "4px" }}
+                    value={descansoBasesForm[id] ?? ""}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      setDescansoBasesForm((prev) => ({
+                        ...prev,
+                        [id]: Number.isFinite(v) && v >= 1 && v <= 500 ? v : prev[id],
+                      }));
+                    }}
+                  />
+                </label>
+              ))}
+            </div>
+          </details>
+        )}
         {error && (
           <p style={styles.primerCampoError}>{error}</p>
         )}
@@ -1288,6 +1465,7 @@ function MapaPotrero({ onLogout }) {
   const [savingPotrero, setSavingPotrero] = useState(false);
   const [savingEvento, setSavingEvento] = useState(false);
   const [loadingPotreros, setLoadingPotreros] = useState(false);
+  const [potrerosReloadTick, setPotrerosReloadTick] = useState(0);
   const [showRotacionModal, setShowRotacionModal] = useState(false);
   const [showEditNombreDialog, setShowEditNombreDialog] = useState(false);
   const [editNombreSheet, setEditNombreSheet] = useState("");
@@ -1437,6 +1615,8 @@ function MapaPotrero({ onLogout }) {
       const lastEvento = {};
       const ultimoMovByPotrero = {};
       const ultimoLluviaByPotrero = {};
+      const movByPotrero = {};
+      const lluviaMm30dByPot = {};
 
       if (ids.length > 0) {
         const { data: eventosData } = await supabase
@@ -1462,6 +1642,15 @@ function MapaPotrero({ onLogout }) {
 
         if (movData) {
           for (const row of movData) {
+            if (!movByPotrero[row.potrero_id]) movByPotrero[row.potrero_id] = [];
+            movByPotrero[row.potrero_id].push(row);
+          }
+          for (const pid of Object.keys(movByPotrero)) {
+            movByPotrero[pid].sort(
+              (a, b) => new Date(b.fecha).getTime() - new Date(a.fecha).getTime(),
+            );
+          }
+          for (const row of movData) {
             if (ultimoMovByPotrero[row.potrero_id]) continue;
             const dir = row.datos?.direccion;
             ultimoMovByPotrero[row.potrero_id] = {
@@ -1469,6 +1658,22 @@ function MapaPotrero({ onLogout }) {
               direccion: dir === "entrada" || dir === "salida" ? dir : undefined,
             };
           }
+        }
+
+        const cutoff30 = new Date();
+        cutoff30.setHours(0, 0, 0, 0);
+        cutoff30.setDate(cutoff30.getDate() - 30);
+        const { data: lluv30Data } = await supabase
+          .from("eventos")
+          .select("potrero_id, datos, fecha")
+          .eq("tipo", "lluvia")
+          .in("potrero_id", ids)
+          .gte("fecha", cutoff30.toISOString());
+
+        for (const row of lluv30Data ?? []) {
+          const mm = Number(row.datos?.mm);
+          if (!Number.isFinite(mm) || mm <= 0) continue;
+          lluviaMm30dByPot[row.potrero_id] = (lluviaMm30dByPot[row.potrero_id] ?? 0) + mm;
         }
 
         const { data: lluvData } = await supabase
@@ -1503,6 +1708,8 @@ function MapaPotrero({ onLogout }) {
           ultimoEvento: lastEvento[p.id] ?? null,
           ultimoMovimiento: ultimoMovByPotrero[p.id] ?? null,
           ultimoLluvia: ultimoLluviaByPotrero[p.id] ?? null,
+          lluviaMm30d: lluviaMm30dByPot[p.id] ?? 0,
+          pastoreoCabezasUltima: pastoreoCabezasUltimaAntesDeSalida(movByPotrero[p.id]),
         }))
       );
       setLoadingPotreros(false);
@@ -1510,7 +1717,7 @@ function MapaPotrero({ onLogout }) {
 
     load();
     return () => { cancelled = true; };
-  }, [selectedCampoId]);
+  }, [selectedCampoId, potrerosReloadTick]);
 
   // ── Aguadas del campo ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -1710,6 +1917,8 @@ function MapaPotrero({ onLogout }) {
         ultimoEvento: null,
         ultimoMovimiento: null,
         ultimoLluvia: null,
+        lluviaMm30d: 0,
+        pastoreoCabezasUltima: null,
       },
     ]);
     setPendingRing(null);
@@ -1798,6 +2007,7 @@ function MapaPotrero({ onLogout }) {
     });
     setShowEventForm(false);
     setHistorialRefresh((x) => x + 1);
+    setPotrerosReloadTick((t) => t + 1);
   }, [selectedPotrero]);
 
   // ── Bottom sheet ──────────────────────────────────────────────────────────
@@ -1908,24 +2118,44 @@ function MapaPotrero({ onLogout }) {
 
   const ndviEntry = selectedPotrero ? ndviById[selectedPotrero.id] : null;
 
-  const recoSheet = selectedPotrero
-    ? recomendacionRotacion(
-      ndviEntry,
-      descansoFromUltimoMovimiento(selectedPotrero.ultimoMovimiento),
-    )
+  const descansoBasesCampo = useMemo(
+    () => mergeDescansoBasesDias(
+      campos.find((c) => c.id === selectedCampoId)?.descanso_bases_dias,
+    ),
+    [campos, selectedCampoId],
+  );
+
+  const motorByPotreroId = useMemo(() => {
+    const m = {};
+    for (const p of potreros) {
+      m[p.id] = computeDescansoInteligente({
+        tipoPasto: p.tipoPasto,
+        ultimoMovimiento: p.ultimoMovimiento,
+        lluviaMm30d: p.lluviaMm30d ?? 0,
+        pastoreoCabezasUltima: p.pastoreoCabezasUltima,
+        basesDias: descansoBasesCampo,
+      });
+    }
+    return m;
+  }, [potreros, descansoBasesCampo]);
+
+  const motorSheet = selectedPotrero
+    ? motorByPotreroId[selectedPotrero.id]
     : null;
 
   const potrerosListos = useMemo(() => {
     const rows = [];
     for (const p of potreros) {
-      const st = descansoFromUltimoMovimiento(p.ultimoMovimiento);
-      if (st.kind === "descanso" && st.days > DESCANSO_LISTO_MIN_DIAS) {
-        rows.push({ potrero: p, days: st.days });
+      const motor = motorByPotreroId[p.id];
+      if (motor?.kind === "descanso" && motor.listo) {
+        rows.push({ potrero: p, motor });
       }
     }
-    rows.sort((a, b) => b.days - a.days);
+    rows.sort(
+      (a, b) => (b.motor.diasTranscurridos ?? 0) - (a.motor.diasTranscurridos ?? 0),
+    );
     return rows;
-  }, [potreros]);
+  }, [potreros, motorByPotreroId]);
 
   const dismissListosBanner = useCallback(() => {
     try {
@@ -2250,9 +2480,9 @@ function MapaPotrero({ onLogout }) {
       {showListosBanner && (
         <div style={styles.listosBanner} role="status">
           <p style={styles.listosBannerText}>
-            Tenés {listosBannerPotrerosCount} potrero
-            {listosBannerPotrerosCount === 1 ? "" : "s"} con más de {DESCANSO_LISTO_MIN_DIAS} días en descanso
-            sin hacienda (último movimiento: salida).
+            Tenés {listosBannerPotrerosCount}{" "}
+            {listosBannerPotrerosCount === 1 ? "potrero listo" : "potreros listos"} para entrar
+            {" "}(descanso necesario cumplido).
           </p>
           <div style={styles.listosBannerActions}>
             <button type="button" style={styles.listosBannerBtn} onClick={scrollToListosPotreros}>
@@ -2273,15 +2503,15 @@ function MapaPotrero({ onLogout }) {
         >
           <div style={styles.listosHeaderRow}>
             <h2 style={styles.listosTitle}>Potreros listos</h2>
-            <span style={styles.listosBadge}>+{DESCANSO_LISTO_MIN_DIAS} días sin hacienda</span>
+            <span style={styles.listosBadge}>Descanso cumplido</span>
           </div>
           {potrerosListos.length === 0 ? (
             <p style={styles.listosEmpty}>
-              Ningún potrero lleva más de {DESCANSO_LISTO_MIN_DIAS} días sin animales (último movimiento: salida).
+              Ningún potrero cumple todavía los días de descanso necesarios para estar listo.
             </p>
           ) : (
             <div style={styles.listosScroll}>
-              {potrerosListos.map(({ potrero: p, days }) => (
+              {potrerosListos.map(({ potrero: p, motor }) => (
                 <button
                   key={p.id}
                   type="button"
@@ -2292,7 +2522,9 @@ function MapaPotrero({ onLogout }) {
                   }}
                 >
                   <span style={styles.listosChipName}>{p.name}</span>
-                  <span style={styles.listosChipDays}>{days} días</span>
+                  <span style={styles.listosChipDays}>
+                    Listo · {motor.diasTranscurridos ?? 0} días
+                  </span>
                 </button>
               ))}
             </div>
@@ -2410,7 +2642,7 @@ function MapaPotrero({ onLogout }) {
                 {potreros.map((pot) => {
                   const reco = recomendacionRotacion(
                     ndviById[pot.id],
-                    descansoFromUltimoMovimiento(pot.ultimoMovimiento),
+                    motorByPotreroId[pot.id],
                   );
                   return (
                     <RotacionRecoMarker
@@ -2690,48 +2922,30 @@ function MapaPotrero({ onLogout }) {
                 </div>
               </div>
               <div style={styles.sheetCard}>
-                <span style={styles.sheetCardLabel}>Días en descanso</span>
-                {(() => {
-                  const st = descansoFromUltimoMovimiento(selectedPotrero.ultimoMovimiento);
-                  if (st.kind === "sin_datos") {
-                    return (
-                      <div style={styles.sheetCardValueNeutral}>Sin datos</div>
-                    );
-                  }
-                  if (st.kind === "en_uso") {
-                    return (
-                      <>
-                        <div style={styles.sheetCardValueNeutral}>Con hacienda</div>
-                        <p style={styles.sheetDescansoHint}>Último movimiento: entrada</p>
-                      </>
-                    );
-                  }
-                  return (
-                    <div style={styles.sheetCardValueNeutral}>
-                      {st.days} días en descanso
-                    </div>
-                  );
-                })()}
-              </div>
-              <div style={styles.sheetCard}>
-                <span style={styles.sheetCardLabel}>Recomendación</span>
-                <div
-                  style={{
-                    ...styles.sheetRecoBadgeBase,
-                    ...(recoSheet.tier === "listo"
-                      ? styles.sheetRecoBadgeListo
-                      : recoSheet.tier === "casi"
-                        ? styles.sheetRecoBadgeCasi
-                        : styles.sheetRecoBadgeRecup),
-                  }}
-                >
-                  {recoSheet.label}
-                </div>
-                {recoSheet.hint && (
-                  <p style={styles.sheetRecoHint}>{recoSheet.hint}</p>
+                <span style={styles.sheetCardLabel}>Descanso</span>
+                {motorSheet?.kind === "sin_datos" ? (
+                  <div style={styles.sheetCardValueNeutral}>Sin movimientos registrados</div>
+                ) : motorSheet?.kind === "en_uso" ? (
+                  <div style={styles.sheetCardValueNeutral}>Con hacienda</div>
+                ) : motorSheet?.kind === "descanso" && motorSheet.listo ? (
+                  <div
+                    style={{
+                      ...styles.sheetRecoBadgeBase,
+                      ...styles.sheetRecoBadgeListo,
+                      marginTop: "4px",
+                    }}
+                  >
+                    Listo para entrar
+                  </div>
+                ) : motorSheet?.kind === "descanso" ? (
+                  <div style={styles.sheetCardValueNeutral}>{motorSheet.primaryLine}</div>
+                ) : (
+                  <div style={styles.sheetCardValueNeutral}>Sin movimientos registrados</div>
                 )}
-                <p style={styles.sheetRecoLluvia}>
+                <p style={{ ...styles.sheetRecoLluvia, marginTop: "10px" }}>
                   🌧️ {formatUltimaLluviaLine(selectedPotrero.ultimoLluvia)}
+                  {" · "}
+                  Últimos 30 d. en este potrero: {selectedPotrero.lluviaMm30d ?? 0} mm acum.
                 </p>
               </div>
             </div>
