@@ -2692,23 +2692,7 @@ function MapaPotrero({ onLogout }) {
             )}
 
             {!pendingRing && selectedCampoId && (
-              aguadaPlacementMode ? (
-                <div style={{ ...styles.floatingStack, ...floatingBottomStyle }}>
-                  <button
-                    type="button"
-                    style={styles.floatingStackCancel}
-                    onClick={() => setAguadaPlacementMode(false)}
-                  >
-                    Listo (aguadas)
-                  </button>
-                </div>
-              ) : !drawingMode ? (
-                <div style={{ ...styles.floatingStack, ...floatingBottomStyle }}>
-                  <button type="button" style={styles.floatingStackPrimary} onClick={startDrawing}>
-                    + Agregar potrero
-                  </button>
-                </div>
-              ) : (
+              drawingMode && !aguadaPlacementMode ? (
                 <button
                   type="button"
                   style={{ ...styles.floatingButtonCancel, ...floatingBottomStyle }}
@@ -2716,7 +2700,25 @@ function MapaPotrero({ onLogout }) {
                 >
                   Cancelar dibujo
                 </button>
-              )
+              ) : !selectedPotrero ? (
+                aguadaPlacementMode ? (
+                  <div style={{ ...styles.floatingStack, ...floatingBottomStyle }}>
+                    <button
+                      type="button"
+                      style={styles.floatingStackCancel}
+                      onClick={() => setAguadaPlacementMode(false)}
+                    >
+                      Listo (aguadas)
+                    </button>
+                  </div>
+                ) : (
+                  <div style={{ ...styles.floatingStack, ...floatingBottomStyle }}>
+                    <button type="button" style={styles.floatingStackPrimary} onClick={startDrawing}>
+                      + Agregar potrero
+                    </button>
+                  </div>
+                )
+              ) : null
             )}
 
             {drawingMode && !aguadaPlacementMode && (
