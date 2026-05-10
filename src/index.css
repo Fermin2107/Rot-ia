@@ -1,3 +1,20 @@
+html,
+body {
+  height: 100%;
+}
+
+#root {
+  height: 100%;
+  min-height: 100vh;
+}
+
+/* Navbar mapa: fondo blanco puro + sombra sutil. */
+.rotia-map-header {
+  background-color: #ffffff !important;
+  background-image: none !important;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06) !important;
+}
+
 body {
   margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
@@ -5,6 +22,55 @@ body {
     sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+/* Leaflet: el tile layer necesita dimensiones reales del contenedor (evita mapa gris/blanco). */
+.leaflet-container {
+  height: 100%;
+  width: 100%;
+}
+
+/* Badge recomendación rotación (Leaflet divIcon) */
+.rotia-reco-badge-wrap {
+  background: transparent !important;
+  border: none !important;
+}
+
+.rotia-reco-badge {
+  box-sizing: border-box;
+  min-width: 72px;
+  padding: 5px 10px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  text-align: center;
+  box-shadow: 0 4px 12px rgba(24, 48, 32, 0.22);
+  border-width: 1px;
+  border-style: solid;
+  font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+.rotia-reco-badge--listo {
+  color: #143d1c;
+  background-color: #c8f0cf;
+  border-color: #7ecf8c;
+}
+
+.rotia-reco-badge--casi {
+  color: #5c4800;
+  background-color: #fff3b0;
+  border-color: #f5e08a;
+}
+
+.rotia-reco-badge--recup {
+  color: #6b1f1f;
+  background-color: #ffd4d4;
+  border-color: #e8a0a0;
+}
+
+.rotia-reco-badge-text {
+  white-space: nowrap;
 }
 
 code {
