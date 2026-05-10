@@ -36,6 +36,12 @@ body {
   border: none !important;
 }
 
+/* Marcador aguada (Leaflet divIcon) */
+.leaflet-div-icon.rotia-aguada-m {
+  background: transparent !important;
+  border: none !important;
+}
+
 .rotia-reco-badge {
   box-sizing: border-box;
   min-width: 72px;

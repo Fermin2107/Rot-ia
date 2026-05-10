@@ -9,6 +9,7 @@ import {
   Polyline,
   Polygon,
   Marker,
+  Popup,
 } from "react-leaflet";
 import area from "@turf/area";
 import { polygon } from "@turf/helpers";
@@ -21,10 +22,32 @@ import { fetchPotreroNdvi, ndviTier } from "./ndviApi";
   - Tabla campos: id, user_id (FK auth.users), name, lat, lng, zoom (default 14), created_at.
     RLS: todas las filas visibles/mutables sólo si auth.uid() = user_id.
 
-  - Tabla potreros: debe incluir user_id, campo_id (FK campos ON DELETE CASCADE), name, positions, created_at.
+  - Tabla potreros: debe incluir user_id, campo_id (FK campos ON DELETE CASCADE), name, positions,
+    tipo_pasto text null (festuca | raigras | campo_natural | verdeo | otro), created_at.
     RLS acorde (dueño del potrero / del campo).
 
+    Migración tipo de pasto:
+      alter table potreros add column if not exists tipo_pasto text;
+
   - Tabla eventos: potrero_id FK potreros ON DELETE CASCADE; user_id si la app lo envía.
+    La app también borra eventos con DELETE explícito antes del potrero (por si el FK no es CASCADE).
+
+  - Tabla aguadas: id, campo_id (FK campos ON DELETE CASCADE), user_id, lat, lng, label text null, created_at.
+    RLS: sólo el dueño (auth.uid() = user_id) y mismo criterio que campos/potreros.
+
+  - potreros.aguada_id uuid null references aguadas(id) on delete set null — aguada asignada al potrero.
+
+    alter table potreros add column if not exists aguada_id uuid references aguadas (id) on delete set null;
+    create table if not exists aguadas (
+      id uuid primary key default gen_random_uuid(),
+      campo_id uuid not null references campos (id) on delete cascade,
+      user_id uuid not null references auth.users (id) on delete cascade,
+      lat double precision not null,
+      lng double precision not null,
+      label text,
+      created_at timestamptz default now()
+    );
+    create index if not exists aguadas_campo_id_idx on aguadas (campo_id);
 
   Migración típica si ya tenés potreros sin campo:
     alter table potreros add column campo_id uuid references campos (id) on delete cascade;
@@ -120,6 +143,16 @@ function LoginScreen() {
 const ARGENTINA_CENTER = [-38.4161, -63.6167];
 const CLICK_DEBOUNCE_MS = 280;
 const CAMPO_STORAGE_KEY = "rotia_campo_id";
+/** sessionStorage: no volver a mostrar el aviso de potreros listos en esta sesión. */
+const LISTOS_BANNER_SESSION_KEY = "rotia_listos_descanso_banner_dismissed";
+
+const aguadaMarkerIcon = L.divIcon({
+  className: "rotia-aguada-m",
+  html: '<div style="font-size:22px;line-height:1;text-align:center">💧</div>',
+  iconSize: [28, 32],
+  iconAnchor: [14, 32],
+  popupAnchor: [0, -28],
+});
 /** Identificación para políticas de uso de Nominatim (el navegador puede sobrescribir User-Agent). */
 const NOMINATIM_APP_ID = "RotiaCampoApp/1.0";
 
@@ -270,18 +303,28 @@ function DrawingClicks({ active, onAddVertex, onAttemptClosePolygon, onHover }) 
   return null;
 }
 
-function DrawingMapUi({ drawingMode }) {
+function DrawingMapUi({ crosshair }) {
   const map = useMap();
   useEffect(() => {
     const el = map.getContainer();
-    if (drawingMode) { map.doubleClickZoom.disable(); el.style.cursor = "crosshair"; }
+    if (crosshair) { map.doubleClickZoom.disable(); el.style.cursor = "crosshair"; }
     else { map.doubleClickZoom.enable(); el.style.cursor = ""; }
     return () => { try { map.doubleClickZoom.enable(); } catch { /* */ } };
-  }, [drawingMode, map]);
+  }, [crosshair, map]);
   return null;
 }
 
-function MapResizeNotifier({ drawingMode, selectedPotrero }) {
+function AguadaPlacementClicks({ active, onPlace }) {
+  useMapEvents({
+    click(e) {
+      if (!active) return;
+      onPlace(e.latlng.lat, e.latlng.lng);
+    },
+  });
+  return null;
+}
+
+function MapResizeNotifier({ drawingMode, selectedPotrero, aguadaPlacementMode }) {
   const map = useMap();
   useEffect(() => {
     const bump = () => map.invalidateSize({ animate: false });
@@ -307,7 +350,7 @@ function MapResizeNotifier({ drawingMode, selectedPotrero }) {
   useEffect(() => {
     const id = window.setTimeout(() => map.invalidateSize({ animate: false }), 0);
     return () => window.clearTimeout(id);
-  }, [map, drawingMode, selectedPotrero]);
+  }, [map, drawingMode, selectedPotrero, aguadaPlacementMode]);
   return null;
 }
 
@@ -318,7 +361,56 @@ const EVENTO_TIPOS = [
   { id: "foto", label: "Foto", icon: "📷" },
 ];
 
+function eventoTipoHistorialIcon(tipo) {
+  return EVENTO_TIPOS.find((t) => t.id === tipo)?.icon ?? "📌";
+}
+
+function formatEventoHistorialFecha(iso) {
+  if (!iso) return "—";
+  try {
+    return new Date(iso).toLocaleString("es-AR", {
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return "—";
+  }
+}
+
 const DESCANSO_LISTO_MIN_DIAS = 60;
+
+/** Valores persistidos en potreros.tipo_pasto (text, opcional). */
+const TIPO_PASTO_IDS = {
+  FESTUCA: "festuca",
+  RAIGRAS: "raigras",
+  CAMPO_NATURAL: "campo_natural",
+  VERDEO: "verdeo",
+  OTRO: "otro",
+};
+
+const TIPOS_PASTO_OPTIONS = [
+  { id: TIPO_PASTO_IDS.FESTUCA, label: "Festuca" },
+  { id: TIPO_PASTO_IDS.RAIGRAS, label: "Raigrás" },
+  { id: TIPO_PASTO_IDS.CAMPO_NATURAL, label: "Campo natural" },
+  { id: TIPO_PASTO_IDS.VERDEO, label: "Verdeo" },
+  { id: TIPO_PASTO_IDS.OTRO, label: "Otro" },
+];
+
+function labelTipoPasto(tipoPasto) {
+  if (!tipoPasto) return null;
+  const o = TIPOS_PASTO_OPTIONS.find((x) => x.id === tipoPasto);
+  return o ? o.label : tipoPasto;
+}
+
+function isKnownTipoPastoId(id) {
+  return Boolean(id && TIPOS_PASTO_OPTIONS.some((o) => o.id === id));
+}
+
+/** Por encima de este umbral los días estimados del motor de rotación se muestran como "—" (UI). */
+const ROTACION_UI_DIAS_ESTIMADOS_MAX = 365;
 
 /** kg materia seca/hectárea ≈ NDVI × este factor (aproximación inicial). */
 const KG_MS_PER_HA_NDVI_FACTOR = 3000;
@@ -422,6 +514,7 @@ function buildRotationRanking(potreros, ndviById, heads, kgMsPorCabezaDia) {
       descansoDias: desc.kind === "descanso" ? desc.days : null,
       enUso,
       ndviCargando,
+      sinAguada: !pot.aguadaId,
     });
   }
   rows.sort((a, b) => {
@@ -439,7 +532,8 @@ function buildRotationRanking(potreros, ndviById, heads, kgMsPorCabezaDia) {
 }
 
 function formatDiasEstimados(d) {
-  if (d == null || !Number.isFinite(d)) return "—";
+  if (d == null || !Number.isFinite(d) || d < 0) return "—";
+  if (d > ROTACION_UI_DIAS_ESTIMADOS_MAX) return "—";
   if (d >= 100) return `${Math.round(d)} días`;
   if (d >= 10) return `${d.toFixed(1)} días`;
   return `${d.toFixed(2)} días`;
@@ -536,7 +630,7 @@ function PlanificarRotacionModal({ open, onClose, potreros, ndviById }) {
                   </div>
                   <div style={styles.rotacionRowMeta}>
                     <span>
-                      {row.areaHa != null ? `${row.areaHa.toFixed(2)} ha` : "— ha"}
+                      {row.areaHa != null ? `${row.areaHa.toFixed(1)} ha` : "— ha"}
                     </span>
                     <span>
                       NDVI {row.ndvi != null ? row.ndvi.toFixed(2) : row.ndviCargando ? "…" : "—"}
@@ -552,6 +646,9 @@ function PlanificarRotacionModal({ open, onClose, potreros, ndviById }) {
                           ? `${row.descansoDias} d`
                           : "sin datos"}
                     </span>
+                    {row.sinAguada && !row.enUso && (
+                      <span style={styles.rotacionWarnAguada}>Sin aguada asignada</span>
+                    )}
                   </div>
                 </div>
               ))}
@@ -563,6 +660,8 @@ function PlanificarRotacionModal({ open, onClose, potreros, ndviById }) {
           Estimación inicial: MS disponible ≈ NDVI × {KG_MS_PER_HA_NDVI_FACTOR} kg/ha;
           consumo {CONSUMO_MS_CABEZA_DIA_MIN}–{CONSUMO_MS_CABEZA_DIA_MAX} kg MS/cabeza/día.
           No incluye pérdidas por pisoteo, estratos ni objetivos de reserva. Ajustá en campo según tu sistema.
+          {" "}
+          Días estimados mayores a {ROTACION_UI_DIAS_ESTIMADOS_MAX} no se muestran.
         </p>
       </div>
     </div>
@@ -810,7 +909,21 @@ function EventoForm({ onSave, onClose, saving }) {
   );
 }
 
-function PrimerCampoModal({ open, onCreated, onPreviewLocation }) {
+/**
+ * @param {"primer"|"adicional"|"edit"} variant
+ * @param {object | null} editingCampo — fila `campos` cuando variant === "edit"
+ */
+function PrimerCampoModal({
+  open,
+  variant,
+  editingCampo,
+  onClose,
+  onCreated,
+  onUpdated,
+  onPreviewLocation,
+  fallbackMapCenter = ARGENTINA_CENTER,
+  fallbackMapZoom = 14,
+}) {
   const [name, setName] = useState("");
   const [query, setQuery] = useState("");
   const [preview, setPreview] = useState(null);
@@ -826,8 +939,24 @@ function PrimerCampoModal({ open, onCreated, onPreviewLocation }) {
       setError(null);
       setBusy(false);
       setSaving(false);
+      return;
     }
-  }, [open]);
+    if (variant === "edit" && editingCampo) {
+      setName(String(editingCampo.name ?? ""));
+      setQuery("");
+      setPreview({
+        lat: Number(editingCampo.lat),
+        lng: Number(editingCampo.lng),
+        label: null,
+      });
+      setError(null);
+      return;
+    }
+    setName("");
+    setQuery("");
+    setPreview(null);
+    setError(null);
+  }, [open, variant, editingCampo]);
 
   const handleBuscar = async () => {
     const q = query.trim();
@@ -844,23 +973,20 @@ function PrimerCampoModal({ open, onCreated, onPreviewLocation }) {
         setError("No se encontró. Probá otro texto o el formato -34.5, -58.3");
         return;
       }
-      setPreview({ lat: r.lat, lng: r.lng, label: r.label });
+      setPreview({ lat: r.lat, lng: r.lng, label: r.label, searched: true });
       onPreviewLocation(r.lat, r.lng, 14);
     } finally {
       setBusy(false);
     }
   };
 
-  const handleCrear = async () => {
+  const handleGuardar = async () => {
     const n = name.trim();
     setError(null);
     if (!n) {
       setError("Ingresá el nombre del establecimiento.");
       return;
     }
-    const lat = preview?.lat ?? ARGENTINA_CENTER[0];
-    const lng = preview?.lng ?? ARGENTINA_CENTER[1];
-    const zoom = preview ? 14 : 6;
     setSaving(true);
     try {
       const { data: { user } } = await supabase.auth.getUser();
@@ -868,6 +994,38 @@ function PrimerCampoModal({ open, onCreated, onPreviewLocation }) {
         setError("Sesión no válida.");
         return;
       }
+
+      if (variant === "edit" && editingCampo) {
+        const lat = preview?.lat ?? Number(editingCampo.lat);
+        const lng = preview?.lng ?? Number(editingCampo.lng);
+        const zoom = preview?.searched ? 14 : (Number(editingCampo.zoom) || 14);
+        const { data, error: updErr } = await supabase
+          .from("campos")
+          .update({ name: n, lat, lng, zoom })
+          .eq("id", editingCampo.id)
+          .select()
+          .single();
+        if (updErr || !data) {
+          console.error(updErr);
+          setError(updErr?.message ?? "No se pudo guardar el establecimiento.");
+          return;
+        }
+        onUpdated?.(data);
+        onClose?.();
+        return;
+      }
+
+      const lat =
+        preview?.lat ??
+        (variant === "primer" ? ARGENTINA_CENTER[0] : fallbackMapCenter[0]);
+      const lng =
+        preview?.lng ??
+        (variant === "primer" ? ARGENTINA_CENTER[1] : fallbackMapCenter[1]);
+      const zoom = preview?.searched
+        ? 14
+        : variant === "primer"
+          ? 6
+          : (Number.isFinite(Number(fallbackMapZoom)) ? Number(fallbackMapZoom) : 14);
       const { data, error: insErr } = await supabase
         .from("campos")
         .insert({
@@ -885,41 +1043,68 @@ function PrimerCampoModal({ open, onCreated, onPreviewLocation }) {
         return;
       }
       onCreated(data);
+      if (variant !== "primer") onClose?.();
     } finally {
       setSaving(false);
     }
   };
 
   if (!open) return null;
+  if (variant === "edit" && !editingCampo) return null;
+
+  const title =
+    variant === "primer"
+      ? "Tu primer establecimiento"
+      : variant === "edit"
+        ? "Editar establecimiento"
+        : "Nuevo campo";
+  const lead =
+    variant === "primer"
+      ? "Creá un campo para dibujar potreros. Podés buscar la ubicación en el mapa o usar el centro de Argentina por defecto."
+      : variant === "edit"
+        ? "Cambiá el nombre y, si querés, buscá otra ubicación para recentrar el mapa del campo."
+        : "Creá otro establecimiento en tu cuenta. Podés buscar la ubicación o dejar el mapa como está y ajustar después.";
+  const canDismiss = variant !== "primer" && typeof onClose === "function";
+  const primaryLabel =
+    variant === "edit"
+      ? (saving ? "Guardando…" : "Guardar cambios")
+      : saving
+        ? "Creando…"
+        : "Crear establecimiento";
 
   return (
-    <div style={styles.primerCampoBackdrop}>
+    <div
+      role="presentation"
+      style={styles.primerCampoBackdrop}
+      onClick={canDismiss ? () => { if (!saving) onClose(); } : undefined}
+    >
       <div
         style={styles.primerCampoDialog}
         role="dialog"
         aria-modal="true"
-        aria-labelledby="primer-campo-title"
+        aria-labelledby="campo-modal-title"
+        onClick={(e) => e.stopPropagation()}
       >
-        <h2 id="primer-campo-title" style={styles.primerCampoTitle}>
-          Tu primer establecimiento
+        <h2 id="campo-modal-title" style={styles.primerCampoTitle}>
+          {title}
         </h2>
         <p style={styles.primerCampoLead}>
-          Creá un campo para dibujar potreros. Podés buscar la ubicación en el mapa o usar el centro de Argentina por defecto.
+          {lead}
         </p>
-        <label style={styles.primerCampoLabel} htmlFor="primer-campo-nombre">Nombre</label>
+        <label style={styles.primerCampoLabel} htmlFor="campo-modal-nombre">Nombre</label>
         <input
-          id="primer-campo-nombre"
+          id="campo-modal-nombre"
           style={styles.primerCampoInput}
           placeholder="Ej. Estancia Los Alamos"
           value={name}
           onChange={(e) => setName(e.target.value)}
         />
-        <label style={{ ...styles.primerCampoLabel, marginTop: "12px" }} htmlFor="primer-campo-buscar">
+        <label style={{ ...styles.primerCampoLabel, marginTop: "12px" }} htmlFor="campo-modal-buscar">
           Ubicación (opcional)
         </label>
         <div style={styles.mapSearchRow}>
           <input
-            id="primer-campo-buscar"
+            id="campo-modal-buscar"
             style={styles.mapSearchInput}
             placeholder="Lugar o -34.6, -58.4"
             value={query}
@@ -950,26 +1135,56 @@ function PrimerCampoModal({ open, onCreated, onPreviewLocation }) {
             ) : null}
           </p>
         )}
-        {!preview && (
+        {!preview && variant === "primer" && (
           <p style={styles.primerCampoHint}>
             Sin búsqueda se usará vista general de Argentina; después podés centrar con el buscador del mapa.
+          </p>
+        )}
+        {!preview && variant === "adicional" && (
+          <p style={styles.primerCampoHint}>
+            Sin búsqueda se usará el centro del mapa actual. Podés mover el mapa antes de guardar o buscar un lugar.
+          </p>
+        )}
+        {variant === "edit" && preview && !preview.searched && (
+          <p style={styles.primerCampoHint}>
+            Ubicación guardada del campo. Usá “Ir” arriba para buscar otra y recentrar.
           </p>
         )}
         {error && (
           <p style={styles.primerCampoError}>{error}</p>
         )}
-        <button
-          type="button"
+        <div
           style={{
-            ...styles.primerCampoPrimary,
-            opacity: saving ? 0.65 : 1,
-            cursor: saving ? "wait" : "pointer",
+            display: "flex",
+            flexDirection: "column",
+            gap: "10px",
+            marginTop: "18px",
           }}
-          onClick={handleCrear}
-          disabled={saving}
         >
-          {saving ? "Creando…" : "Crear establecimiento"}
-        </button>
+          {canDismiss && (
+            <button
+              type="button"
+              style={styles.primerCampoCancel}
+              onClick={() => { if (!saving) onClose(); }}
+              disabled={saving}
+            >
+              Cancelar
+            </button>
+          )}
+          <button
+            type="button"
+            style={{
+              ...styles.primerCampoPrimary,
+              opacity: saving ? 0.65 : 1,
+              cursor: saving ? "wait" : "pointer",
+              marginTop: 0,
+            }}
+            onClick={handleGuardar}
+            disabled={saving}
+          >
+            {primaryLabel}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -985,12 +1200,15 @@ function MapaPotrero({ onLogout }) {
   const [campos, setCampos] = useState([]);
   const [loadingCampos, setLoadingCampos] = useState(true);
   const [selectedCampoId, setSelectedCampoId] = useState(null);
+  const [campoNuevoModalOpen, setCampoNuevoModalOpen] = useState(false);
+  const [campoEditModalOpen, setCampoEditModalOpen] = useState(false);
   const [mapCenter, setMapCenter] = useState(ARGENTINA_CENTER);
   const [mapZoom, setMapZoom] = useState(6);
   const [locationQuery, setLocationQuery] = useState("");
   const [locationSearchBusy, setLocationSearchBusy] = useState(false);
   const [locationSearchError, setLocationSearchError] = useState(null);
   const [nombreInput, setNombreInput] = useState("");
+  const [tipoPastoNuevo, setTipoPastoNuevo] = useState("");
   const [selectedPotrero, setSelectedPotrero] = useState(null);
   const [sheetEntered, setSheetEntered] = useState(false);
   const [showEventForm, setShowEventForm] = useState(false);
@@ -1000,12 +1218,29 @@ function MapaPotrero({ onLogout }) {
   const [showRotacionModal, setShowRotacionModal] = useState(false);
   const [showEditNombreDialog, setShowEditNombreDialog] = useState(false);
   const [editNombreSheet, setEditNombreSheet] = useState("");
+  const [editTipoPastoSheet, setEditTipoPastoSheet] = useState("");
   const [savingEditNombre, setSavingEditNombre] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deletingPotrero, setDeletingPotrero] = useState(false);
   const [potreroSheetError, setPotreroSheetError] = useState(null);
   const ndviByIdRef = useRef({});
   const [ndviById, setNdviById] = useState({});
+  const listosSectionRef = useRef(null);
+  const [aguadas, setAguadas] = useState([]);
+  const [loadingAguadas, setLoadingAguadas] = useState(false);
+  const [aguadaPlacementMode, setAguadaPlacementMode] = useState(false);
+  const [sheetTab, setSheetTab] = useState("resumen");
+  const [historialRows, setHistorialRows] = useState([]);
+  const [historialLoading, setHistorialLoading] = useState(false);
+  const [historialError, setHistorialError] = useState(null);
+  const [historialRefresh, setHistorialRefresh] = useState(0);
+  const [listosBannerDismissed, setListosBannerDismissed] = useState(() => {
+    try {
+      return sessionStorage.getItem(LISTOS_BANNER_SESSION_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
 
   const draftVerticesRef = useRef(draftVertices);
   draftVerticesRef.current = draftVertices;
@@ -1013,6 +1248,10 @@ function MapaPotrero({ onLogout }) {
   useEffect(() => {
     ndviByIdRef.current = ndviById;
   }, [ndviById]);
+
+  useEffect(() => {
+    if (campoEditModalOpen && !selectedCampoId) setCampoEditModalOpen(false);
+  }, [campoEditModalOpen, selectedCampoId]);
 
   // ── Campos del usuario ────────────────────────────────────────────────────
   useEffect(() => {
@@ -1082,6 +1321,7 @@ function MapaPotrero({ onLogout }) {
     setShowEventForm(false);
     setShowEditNombreDialog(false);
     setShowDeleteConfirm(false);
+    setAguadaPlacementMode(false);
   }, [selectedCampoId]);
 
   // ── Potreros del campo seleccionado ───────────────────────────────────────
@@ -1184,6 +1424,8 @@ function MapaPotrero({ onLogout }) {
         potrerosData.map((p) => ({
           id: p.id,
           name: p.name,
+          tipoPasto: p.tipo_pasto ?? null,
+          aguadaId: p.aguada_id ?? null,
           positions: p.positions,
           ultimoEvento: lastEvento[p.id] ?? null,
           ultimoMovimiento: ultimoMovByPotrero[p.id] ?? null,
@@ -1196,6 +1438,69 @@ function MapaPotrero({ onLogout }) {
     load();
     return () => { cancelled = true; };
   }, [selectedCampoId]);
+
+  // ── Aguadas del campo ─────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!selectedCampoId) {
+      setAguadas([]);
+      setLoadingAguadas(false);
+      return undefined;
+    }
+    let cancelled = false;
+    (async () => {
+      setLoadingAguadas(true);
+      const { data, error } = await supabase
+        .from("aguadas")
+        .select("*")
+        .eq("campo_id", selectedCampoId)
+        .order("created_at", { ascending: true });
+      if (cancelled) return;
+      setLoadingAguadas(false);
+      if (error) {
+        console.error("Error cargando aguadas:", error);
+        setAguadas([]);
+        return;
+      }
+      setAguadas(data ?? []);
+    })();
+    return () => { cancelled = true; };
+  }, [selectedCampoId]);
+
+  // ── Historial de eventos (pestaña sheet) ─────────────────────────────────
+  useEffect(() => {
+    const pid = selectedPotrero?.id;
+    if (!pid) {
+      setHistorialRows([]);
+      setHistorialError(null);
+      setHistorialLoading(false);
+      return undefined;
+    }
+    if (sheetTab !== "historial") return undefined;
+    let cancelled = false;
+    (async () => {
+      setHistorialLoading(true);
+      setHistorialError(null);
+      const { data, error } = await supabase
+        .from("eventos")
+        .select("id, tipo, descripcion, fecha, datos")
+        .eq("potrero_id", pid)
+        .order("fecha", { ascending: false })
+        .limit(10);
+      if (cancelled) return;
+      setHistorialLoading(false);
+      if (error) {
+        setHistorialError(error.message ?? "No se pudo cargar el historial.");
+        setHistorialRows([]);
+        return;
+      }
+      setHistorialRows(data ?? []);
+    })();
+    return () => { cancelled = true; };
+  }, [selectedPotrero?.id, sheetTab, historialRefresh]);
+
+  useEffect(() => {
+    setSheetTab("resumen");
+  }, [selectedPotrero?.id]);
 
   // ── NDVI para todos los potreros (badges de recomendación en el mapa) ─────
   useEffect(() => {
@@ -1252,10 +1557,12 @@ function MapaPotrero({ onLogout }) {
 
   // ── Dibujo ────────────────────────────────────────────────────────────────
   const startDrawing = useCallback(() => {
+    setAguadaPlacementMode(false);
     setSelectedPotrero(null);
     setSheetEntered(false);
     setPendingRing(null);
     setNombreInput("");
+    setTipoPastoNuevo("");
     setDraftVertices([]);
     setPreviewTip(null);
     setDrawingMode(true);
@@ -1279,6 +1586,7 @@ function MapaPotrero({ onLogout }) {
     setDraftVertices([]);
     setPreviewTip(null);
     setNombreInput("");
+    setTipoPastoNuevo("");
   }, []);
 
   // ── Guardar potrero en Supabase ───────────────────────────────────────────
@@ -1289,6 +1597,7 @@ function MapaPotrero({ onLogout }) {
 
     setSavingPotrero(true);
     const { data: { user } } = await supabase.auth.getUser();
+    const tipoDb = isKnownTipoPastoId(tipoPastoNuevo) ? tipoPastoNuevo : null;
     const { data, error } = await supabase
       .from("potreros")
       .insert({
@@ -1296,6 +1605,7 @@ function MapaPotrero({ onLogout }) {
         positions: ring,
         user_id: user?.id,
         campo_id: selectedCampoId,
+        tipo_pasto: tipoDb,
       })
       .select()
       .single();
@@ -1311,6 +1621,8 @@ function MapaPotrero({ onLogout }) {
       {
         id: data.id,
         name: data.name,
+        tipoPasto: data.tipo_pasto ?? null,
+        aguadaId: data.aguada_id ?? null,
         positions: data.positions,
         ultimoEvento: null,
         ultimoMovimiento: null,
@@ -1319,7 +1631,8 @@ function MapaPotrero({ onLogout }) {
     ]);
     setPendingRing(null);
     setNombreInput("");
-  }, [nombreInput, pendingRing, selectedCampoId]);
+    setTipoPastoNuevo("");
+  }, [nombreInput, tipoPastoNuevo, pendingRing, selectedCampoId]);
 
   const handleLocationSearch = useCallback(async () => {
     const q = locationQuery.trim();
@@ -1342,6 +1655,7 @@ function MapaPotrero({ onLogout }) {
   const handleCancelNombre = useCallback(() => {
     setPendingRing(null);
     setNombreInput("");
+    setTipoPastoNuevo("");
   }, []);
 
   // ── Guardar evento en Supabase ────────────────────────────────────────────
@@ -1400,6 +1714,7 @@ function MapaPotrero({ onLogout }) {
       return next;
     });
     setShowEventForm(false);
+    setHistorialRefresh((x) => x + 1);
   }, [selectedPotrero]);
 
   // ── Bottom sheet ──────────────────────────────────────────────────────────
@@ -1430,11 +1745,13 @@ function MapaPotrero({ onLogout }) {
     if (!name || !selectedPotrero) return;
     setSavingEditNombre(true);
     setPotreroSheetError(null);
-    const { data: updatedRows, error } = await supabase
+    const tipoDb = isKnownTipoPastoId(editTipoPastoSheet) ? editTipoPastoSheet : null;
+    let upd = supabase
       .from("potreros")
-      .update({ name })
-      .eq("id", selectedPotrero.id)
-      .select("id");
+      .update({ name, tipo_pasto: tipoDb })
+      .eq("id", selectedPotrero.id);
+    if (selectedCampoId) upd = upd.eq("campo_id", selectedCampoId);
+    const { data: updatedRows, error } = await upd.select("id");
     setSavingEditNombre(false);
     if (error) {
       console.error("Error actualizando potrero:", error);
@@ -1448,22 +1765,39 @@ function MapaPotrero({ onLogout }) {
       return;
     }
     setPotreros((prev) =>
-      prev.map((p) => (p.id === selectedPotrero.id ? { ...p, name } : p)),
+      prev.map((p) =>
+        p.id === selectedPotrero.id ? { ...p, name, tipoPasto: tipoDb } : p,
+      ),
     );
-    setSelectedPotrero((prev) => (prev ? { ...prev, name } : prev));
+    setSelectedPotrero((prev) =>
+      prev ? { ...prev, name, tipoPasto: tipoDb } : prev,
+    );
     setShowEditNombreDialog(false);
-  }, [editNombreSheet, selectedPotrero]);
+  }, [editNombreSheet, editTipoPastoSheet, selectedPotrero, selectedCampoId]);
 
   const handleConfirmDeletePotrero = useCallback(async () => {
     if (!selectedPotrero) return;
     const id = selectedPotrero.id;
     setDeletingPotrero(true);
     setPotreroSheetError(null);
-    const { data: deletedRows, error } = await supabase
-      .from("potreros")
+
+    const { error: eventosError } = await supabase
+      .from("eventos")
       .delete()
-      .eq("id", id)
-      .select("id");
+      .eq("potrero_id", id);
+    if (eventosError) {
+      console.error("Error eliminando eventos del potrero:", eventosError);
+      setDeletingPotrero(false);
+      setPotreroSheetError(
+        eventosError.message ?? "No se pudieron borrar los eventos (revisá permisos RLS).",
+      );
+      setShowDeleteConfirm(false);
+      return;
+    }
+
+    let del = supabase.from("potreros").delete().eq("id", id);
+    if (selectedCampoId) del = del.eq("campo_id", selectedCampoId);
+    const { data: deletedRows, error } = await del.select("id");
     setDeletingPotrero(false);
     if (error) {
       console.error("Error eliminando potrero:", error);
@@ -1487,7 +1821,7 @@ function MapaPotrero({ onLogout }) {
     });
     setSheetEntered(false);
     setSelectedPotrero(null);
-  }, [selectedPotrero]);
+  }, [selectedPotrero, selectedCampoId]);
 
   const ndviEntry = selectedPotrero ? ndviById[selectedPotrero.id] : null;
 
@@ -1510,11 +1844,121 @@ function MapaPotrero({ onLogout }) {
     return rows;
   }, [potreros]);
 
+  const dismissListosBanner = useCallback(() => {
+    try {
+      sessionStorage.setItem(LISTOS_BANNER_SESSION_KEY, "1");
+    } catch {
+      /* ignore */
+    }
+    setListosBannerDismissed(true);
+  }, []);
+
+  const scrollToListosPotreros = useCallback(() => {
+    listosSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, []);
+
+  const listosBannerPotrerosCount = potrerosListos.length;
+  const showListosBanner =
+    potreros.length > 0 && listosBannerPotrerosCount > 0 && !listosBannerDismissed;
+
+  const handlePlaceAguada = useCallback(async (lat, lng) => {
+    if (!selectedCampoId || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return;
+    const { data, error } = await supabase
+      .from("aguadas")
+      .insert({
+        campo_id: selectedCampoId,
+        user_id: user.id,
+        lat,
+        lng,
+        label: null,
+      })
+      .select()
+      .single();
+    if (error || !data) {
+      console.error("Error creando aguada:", error);
+      return;
+    }
+    setAguadas((prev) => [...prev, data]);
+  }, [selectedCampoId]);
+
+  const handleDeleteAguada = useCallback(async (aguadaId) => {
+    if (!selectedCampoId) return;
+    const { data: deleted, error } = await supabase
+      .from("aguadas")
+      .delete()
+      .eq("id", aguadaId)
+      .eq("campo_id", selectedCampoId)
+      .select("id");
+    if (error) {
+      console.error("Error eliminando aguada:", error);
+      return;
+    }
+    if (!deleted?.length) return;
+    setAguadas((prev) => prev.filter((a) => a.id !== aguadaId));
+    setPotreros((prev) =>
+      prev.map((p) => (p.aguadaId === aguadaId ? { ...p, aguadaId: null } : p)),
+    );
+    setSelectedPotrero((prev) =>
+      prev && prev.aguadaId === aguadaId ? { ...prev, aguadaId: null } : prev,
+    );
+  }, [selectedCampoId]);
+
+  const handleAguadaAsignadaChange = useCallback(async (aguadaIdVal) => {
+    if (!selectedPotrero || !selectedCampoId) return;
+    const aguadaIdNorm = aguadaIdVal && aguadaIdVal !== "" ? aguadaIdVal : null;
+    setPotreroSheetError(null);
+    const { data: rows, error } = await supabase
+      .from("potreros")
+      .update({ aguada_id: aguadaIdNorm })
+      .eq("id", selectedPotrero.id)
+      .eq("campo_id", selectedCampoId)
+      .select("id");
+    if (error) {
+      console.error("Error asignando aguada:", error);
+      setPotreroSheetError(error.message ?? "No se pudo guardar la aguada.");
+      return;
+    }
+    if (!rows?.length) {
+      setPotreroSheetError(
+        "No se actualizó el potrero (sin permiso, aguada inexistente o no pertenece a este campo).",
+      );
+      return;
+    }
+    setPotreros((prev) =>
+      prev.map((p) =>
+        p.id === selectedPotrero.id ? { ...p, aguadaId: aguadaIdNorm } : p,
+      ),
+    );
+    setSelectedPotrero((prev) =>
+      prev ? { ...prev, aguadaId: aguadaIdNorm } : prev,
+    );
+  }, [selectedPotrero, selectedCampoId]);
+
   const lastDraft = draftVertices[draftVertices.length - 1];
   const hoverSegment =
     drawingMode && previewTip && draftVertices.length > 0 && lastDraft
       ? [lastDraft, previewTip]
       : null;
+
+  const isPrimerCampoBloqueo = !loadingCampos && campos.length === 0;
+  const campoModalAbierto =
+    isPrimerCampoBloqueo || campoNuevoModalOpen || campoEditModalOpen;
+  const campoModalVariant = isPrimerCampoBloqueo
+    ? "primer"
+    : campoEditModalOpen
+      ? "edit"
+      : "adicional";
+  const editingCampoFila =
+    campoEditModalOpen && selectedCampoId
+      ? campos.find((c) => c.id === selectedCampoId) ?? null
+      : null;
+
+  const closeCampoAuxModal = useCallback(() => {
+    setCampoNuevoModalOpen(false);
+    setCampoEditModalOpen(false);
+  }, []);
 
   return (
     <main style={styles.mapPage}>
@@ -1524,17 +1968,47 @@ function MapaPotrero({ onLogout }) {
           <strong style={styles.topTitle}>Rotia</strong>
         </div>
         {campos.length > 0 && (
-          <div style={styles.topCampoSelectWrap}>
-            <select
-              aria-label="Campo activo"
-              style={styles.campoSelect}
-              value={selectedCampoId ?? ""}
-              onChange={(e) => setSelectedCampoId(e.target.value)}
+          <div style={styles.topCampoRow}>
+            <div style={styles.topCampoSelectWrap}>
+              <select
+                aria-label="Campo activo"
+                style={styles.campoSelect}
+                value={selectedCampoId ?? ""}
+                onChange={(e) => setSelectedCampoId(e.target.value)}
+              >
+                {campos.map((c) => (
+                  <option key={c.id} value={c.id}>{c.name}</option>
+                ))}
+              </select>
+            </div>
+            <button
+              type="button"
+              aria-label="Editar nombre y ubicación del campo"
+              title="Editar campo"
+              style={{
+                ...styles.topCampoGear,
+                ...(!selectedCampoId ? styles.topCampoGearDisabled : {}),
+              }}
+              disabled={!selectedCampoId}
+              onClick={() => {
+                setMenuOpen(false);
+                setCampoNuevoModalOpen(false);
+                setCampoEditModalOpen(true);
+              }}
             >
-              {campos.map((c) => (
-                <option key={c.id} value={c.id}>{c.name}</option>
-              ))}
-            </select>
+              ⚙️
+            </button>
+            <button
+              type="button"
+              style={styles.topCampoNuevoBtn}
+              onClick={() => {
+                setMenuOpen(false);
+                setCampoEditModalOpen(false);
+                setCampoNuevoModalOpen(true);
+              }}
+            >
+              Nuevo campo
+            </button>
           </div>
         )}
         <div style={{ ...styles.topBarActions, marginLeft: "auto" }}>
@@ -1581,8 +2055,30 @@ function MapaPotrero({ onLogout }) {
         </div>
       </header>
 
+      {showListosBanner && (
+        <div style={styles.listosBanner} role="status">
+          <p style={styles.listosBannerText}>
+            Tenés {listosBannerPotrerosCount} potrero
+            {listosBannerPotrerosCount === 1 ? "" : "s"} con más de {DESCANSO_LISTO_MIN_DIAS} días en descanso
+            sin hacienda (último movimiento: salida).
+          </p>
+          <div style={styles.listosBannerActions}>
+            <button type="button" style={styles.listosBannerBtn} onClick={scrollToListosPotreros}>
+              Ver listos
+            </button>
+            <button type="button" style={styles.listosBannerDismiss} onClick={dismissListosBanner}>
+              Cerrar aviso
+            </button>
+          </div>
+        </div>
+      )}
+
       {potreros.length > 0 && (
-        <section style={styles.listosSection} aria-label="Potreros listos">
+        <section
+          ref={listosSectionRef}
+          style={styles.listosSection}
+          aria-label="Potreros listos"
+        >
           <div style={styles.listosHeaderRow}>
             <h2 style={styles.listosTitle}>Potreros listos</h2>
             <span style={styles.listosBadge}>+{DESCANSO_LISTO_MIN_DIAS} días sin hacienda</span>
@@ -1658,7 +2154,11 @@ function MapaPotrero({ onLogout }) {
           <div style={styles.mapInner}>
             <div style={styles.mapGrow}>
               <MapContainer center={mapCenter} zoom={mapZoom} scrollWheelZoom style={styles.map}>
-                <MapResizeNotifier drawingMode={drawingMode} selectedPotrero={selectedPotrero} />
+                <MapResizeNotifier
+                  drawingMode={drawingMode}
+                  selectedPotrero={selectedPotrero}
+                  aguadaPlacementMode={aguadaPlacementMode}
+                />
                 <MapViewSync center={mapCenter} zoom={mapZoom} />
                 <TileLayer
                   attribution='Tiles &copy; <a href="https://www.esri.com/">Esri</a> &mdash; Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community'
@@ -1669,13 +2169,14 @@ function MapaPotrero({ onLogout }) {
                   attribution='Reference: <a href="https://www.esri.com/">Esri</a>, HERE, Garmin, USGS, OpenStreetMap contributors, GIS User Community'
                   url="https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}"
                 />
-                <DrawingMapUi drawingMode={drawingMode} />
+                <DrawingMapUi crosshair={drawingMode || aguadaPlacementMode} />
                 <DrawingClicks
                   active={drawingMode}
                   onAddVertex={handleAddVertex}
                   onAttemptClosePolygon={handleAttemptClosePolygon}
                   onHover={setPreviewTip}
                 />
+                <AguadaPlacementClicks active={aguadaPlacementMode} onPlace={handlePlaceAguada} />
 
                 {draftVertices.map((coords, idx) => (
                   <CircleMarker key={`draft-${idx}`} center={coords} radius={6}
@@ -1702,11 +2203,11 @@ function MapaPotrero({ onLogout }) {
                     positions={pot.positions}
                     pathOptions={polygonStyleForNdvi(
                       ndviById[pot.id],
-                      !(drawingMode || !!pendingRing),
+                      !(drawingMode || !!pendingRing || aguadaPlacementMode),
                     )}
                     eventHandlers={{
                       click: (e) => {
-                        if (drawingMode || pendingRing) return;
+                        if (drawingMode || pendingRing || aguadaPlacementMode) return;
                         const ev = e.originalEvent;
                         if (ev) L.DomEvent.stopPropagation(ev);
                         setSelectedPotrero(pot);
@@ -1724,25 +2225,80 @@ function MapaPotrero({ onLogout }) {
                       key={`reco-${pot.id}`}
                       pot={pot}
                       reco={reco}
-                      interactive={!(drawingMode || !!pendingRing)}
+                      interactive={!(drawingMode || !!pendingRing || aguadaPlacementMode)}
                       onSelect={setSelectedPotrero}
                     />
                   );
                 })}
+                {aguadas.map((a) => (
+                  <Marker
+                    key={`ag-${a.id}`}
+                    position={[Number(a.lat), Number(a.lng)]}
+                    icon={aguadaMarkerIcon}
+                    zIndexOffset={800}
+                  >
+                    <Popup>
+                      <div style={{ minWidth: "140px" }}>
+                        <div style={{ fontWeight: 800, color: "#1a3d5c", fontSize: "14px" }}>Aguada</div>
+                        {a.label ? (
+                          <p style={{ margin: "6px 0 0", fontSize: "13px", color: "#2a3f2f" }}>{a.label}</p>
+                        ) : null}
+                        <button
+                          type="button"
+                          style={styles.aguadaPopupBtn}
+                          onClick={() => { void handleDeleteAguada(a.id); }}
+                        >
+                          Eliminar aguada
+                        </button>
+                      </div>
+                    </Popup>
+                  </Marker>
+                ))}
               </MapContainer>
             </div>
 
-            {(loadingCampos || loadingPotreros) && (
+            {(loadingCampos || loadingPotreros || loadingAguadas) && (
               <div style={styles.loadingBadge}>
-                {loadingCampos ? "Cargando establecimientos…" : "Cargando potreros…"}
+                {loadingCampos
+                  ? "Cargando establecimientos…"
+                  : loadingPotreros
+                    ? "Cargando potreros…"
+                    : "Cargando aguadas…"}
               </div>
             )}
 
             {!pendingRing && selectedCampoId && (
-              !drawingMode ? (
-                <button type="button" style={styles.floatingButton} onClick={startDrawing}>
-                  + Agregar potrero
-                </button>
+              aguadaPlacementMode ? (
+                <div style={styles.floatingStack}>
+                  <button
+                    type="button"
+                    style={styles.floatingStackCancel}
+                    onClick={() => setAguadaPlacementMode(false)}
+                  >
+                    Listo (aguadas)
+                  </button>
+                </div>
+              ) : !drawingMode ? (
+                <div style={styles.floatingStack}>
+                  <button
+                    type="button"
+                    style={styles.floatingAguadaBtn}
+                    onClick={() => {
+                      setDrawingMode(false);
+                      setDraftVertices([]);
+                      setPreviewTip(null);
+                      setPendingRing(null);
+                      setSelectedPotrero(null);
+                      setSheetEntered(false);
+                      setAguadaPlacementMode(true);
+                    }}
+                  >
+                    💧 Colocar aguadas
+                  </button>
+                  <button type="button" style={styles.floatingStackPrimary} onClick={startDrawing}>
+                    + Agregar potrero
+                  </button>
+                </div>
               ) : (
                 <button type="button" style={styles.floatingButtonCancel} onClick={cancelDrawing}>
                   Cancelar dibujo
@@ -1750,15 +2306,27 @@ function MapaPotrero({ onLogout }) {
               )
             )}
 
-            {drawingMode && (
+            {drawingMode && !aguadaPlacementMode && (
               <p style={styles.drawHint}>Doble click para cerrar el potrero</p>
+            )}
+            {aguadaPlacementMode && (
+              <p
+                style={{
+                  ...styles.drawHint,
+                  bottom: "calc(76px + env(safe-area-inset-bottom, 0px))",
+                  backgroundColor: "rgba(232, 244, 255, 0.95)",
+                  color: "#1a4a6e",
+                }}
+              >
+                Tocá el mapa para colocar una aguada
+              </p>
             )}
 
             {pendingRing && (
               <dialog open style={styles.nameDialogBackdrop}>
                 <div style={styles.nameDialog}>
-                  <h2 style={styles.nameDialogTitle}>Nombre del potrero</h2>
-                  <p style={styles.nameDialogText}>Elegí un nombre para este potrero.</p>
+                  <h2 style={styles.nameDialogTitle}>Nuevo potrero</h2>
+                  <p style={styles.nameDialogText}>Nombre y, si querés, tipo de pasto.</p>
                   <input
                     autoFocus
                     style={styles.nameDialogInput}
@@ -1767,6 +2335,20 @@ function MapaPotrero({ onLogout }) {
                     placeholder="Ej. Los Algarrobos"
                     onChange={(e) => setNombreInput(e.target.value)}
                   />
+                  <label style={styles.nameDialogFieldLabel} htmlFor="nuevo-tipo-pasto">
+                    Tipo de pasto (opcional)
+                  </label>
+                  <select
+                    id="nuevo-tipo-pasto"
+                    style={styles.nameDialogSelect}
+                    value={tipoPastoNuevo}
+                    onChange={(e) => setTipoPastoNuevo(e.target.value)}
+                  >
+                    <option value="">Sin especificar</option>
+                    {TIPOS_PASTO_OPTIONS.map((o) => (
+                      <option key={o.id} value={o.id}>{o.label}</option>
+                    ))}
+                  </select>
                   <div style={styles.nameDialogActions}>
                     <button type="button" style={styles.nameDialogSecondary}
                       onClick={handleCancelNombre} disabled={savingPotrero}>
@@ -1824,6 +2406,34 @@ function MapaPotrero({ onLogout }) {
                 aria-label="Cerrar panel del potrero">×</button>
             </div>
 
+            <div style={styles.sheetTabsRow} role="tablist" aria-label="Panel del potrero">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={sheetTab === "resumen"}
+                style={{
+                  ...styles.sheetTab,
+                  ...(sheetTab === "resumen" ? styles.sheetTabActive : {}),
+                }}
+                onClick={() => setSheetTab("resumen")}
+              >
+                Resumen
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={sheetTab === "historial"}
+                style={{
+                  ...styles.sheetTab,
+                  ...(sheetTab === "historial" ? styles.sheetTabActive : {}),
+                }}
+                onClick={() => setSheetTab("historial")}
+              >
+                Historial
+              </button>
+            </div>
+
+            {sheetTab === "resumen" ? (
             <div style={styles.sheetCards}>
               <div style={styles.sheetCard}>
                 <span style={styles.sheetCardLabel}>Estado NDVI</span>
@@ -1859,6 +2469,35 @@ function MapaPotrero({ onLogout }) {
                   <div style={styles.sheetNdviPlaceholder}>
                     Sin datos de satélite
                   </div>
+                )}
+              </div>
+              <div style={styles.sheetCard}>
+                <span style={styles.sheetCardLabel}>Tipo de pasto</span>
+                <div style={styles.sheetCardValueNeutral}>
+                  {labelTipoPasto(selectedPotrero.tipoPasto) ?? "Sin especificar"}
+                </div>
+              </div>
+              <div style={styles.sheetCard}>
+                <span style={styles.sheetCardLabel}>Aguada asignada</span>
+                <select
+                  aria-label="Aguada asignada al potrero"
+                  style={styles.sheetAguadaSelect}
+                  value={selectedPotrero.aguadaId ?? ""}
+                  onChange={(e) => { void handleAguadaAsignadaChange(e.target.value); }}
+                >
+                  <option value="">Sin aguada</option>
+                  {aguadas.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.label?.trim()
+                        ? a.label
+                        : `Aguada (${Number(a.lat).toFixed(4)}, ${Number(a.lng).toFixed(4)})`}
+                    </option>
+                  ))}
+                </select>
+                {aguadas.length === 0 && (
+                  <p style={{ ...styles.sheetRecoHint, marginTop: "8px" }}>
+                    No hay aguadas en el mapa. Usá “💧 Colocar aguadas” y tocá el mapa.
+                  </p>
                 )}
               </div>
               <div style={styles.sheetCard}>
@@ -1913,6 +2552,41 @@ function MapaPotrero({ onLogout }) {
                 </p>
               </div>
             </div>
+            ) : (
+            <div style={styles.historialList} role="tabpanel">
+              {historialLoading && (
+                <p style={styles.historialEmpty}>Cargando historial…</p>
+              )}
+              {historialError && !historialLoading && (
+                <p style={styles.sheetError}>{historialError}</p>
+              )}
+              {!historialLoading && !historialError && historialRows.length === 0 && (
+                <p style={styles.historialEmpty}>Todavía no hay eventos en este potrero.</p>
+              )}
+              {!historialLoading && !historialError && historialRows.map((ev) => {
+                const tipoLabel = EVENTO_TIPOS.find((t) => t.id === ev.tipo)?.label ?? ev.tipo;
+                return (
+                  <div key={ev.id} style={styles.historialRow}>
+                    <span style={styles.historialIcon} aria-hidden="true">
+                      {eventoTipoHistorialIcon(ev.tipo)}
+                    </span>
+                    <div style={styles.historialMain}>
+                      <div style={styles.historialTipo}>{tipoLabel}</div>
+                      <div style={styles.historialFecha}>{formatEventoHistorialFecha(ev.fecha)}</div>
+                      {ev.descripcion ? (
+                        <div style={styles.historialDesc}>{ev.descripcion}</div>
+                      ) : null}
+                      {ev.tipo === "foto" && (
+                        <div style={styles.historialFotoNote}>
+                          Vista previa: se mostrará acá cuando conectemos Supabase Storage (bloque aparte).
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            )}
 
             {potreroSheetError && (
               <p style={styles.sheetError}>{potreroSheetError}</p>
@@ -1925,10 +2599,12 @@ function MapaPotrero({ onLogout }) {
                 onClick={() => {
                   setPotreroSheetError(null);
                   setEditNombreSheet(selectedPotrero.name);
+                  const t = selectedPotrero.tipoPasto;
+                  setEditTipoPastoSheet(isKnownTipoPastoId(t) ? t : "");
                   setShowEditNombreDialog(true);
                 }}
               >
-                Editar nombre
+                Editar potrero
               </button>
               <button
                 type="button"
@@ -1963,15 +2639,31 @@ function MapaPotrero({ onLogout }) {
                 style={styles.sheetNestedDialog}
                 onClick={(e) => e.stopPropagation()}
               >
-                <h3 id="edit-pot-title" style={styles.sheetNestedTitle}>Editar nombre</h3>
+                <h3 id="edit-pot-title" style={styles.sheetNestedTitle}>Editar potrero</h3>
+                <label style={styles.sheetNestedFieldLabel} htmlFor="edit-pot-nombre">Nombre</label>
                 <input
+                  id="edit-pot-nombre"
                   autoFocus
-                  style={styles.sheetNestedInput}
+                  style={styles.sheetNestedInputTight}
                   type="text"
                   value={editNombreSheet}
                   onChange={(e) => setEditNombreSheet(e.target.value)}
                   placeholder="Nombre del potrero"
                 />
+                <label style={styles.sheetNestedFieldLabel} htmlFor="edit-tipo-pasto">
+                  Tipo de pasto (opcional)
+                </label>
+                <select
+                  id="edit-tipo-pasto"
+                  style={styles.sheetNestedSelect}
+                  value={editTipoPastoSheet}
+                  onChange={(e) => setEditTipoPastoSheet(e.target.value)}
+                >
+                  <option value="">Sin especificar</option>
+                  {TIPOS_PASTO_OPTIONS.map((o) => (
+                    <option key={o.id} value={o.id}>{o.label}</option>
+                  ))}
+                </select>
                 <div style={styles.sheetNestedActions}>
                   <button
                     type="button"
@@ -2058,7 +2750,10 @@ function MapaPotrero({ onLogout }) {
       />
 
       <PrimerCampoModal
-        open={!loadingCampos && campos.length === 0}
+        open={campoModalAbierto}
+        variant={campoModalVariant}
+        editingCampo={editingCampoFila}
+        onClose={isPrimerCampoBloqueo ? undefined : closeCampoAuxModal}
         onPreviewLocation={(lat, lng, zoom) => {
           setMapCenter([lat, lng]);
           setMapZoom(zoom);
@@ -2067,6 +2762,13 @@ function MapaPotrero({ onLogout }) {
           setCampos((prev) => [...prev, row]);
           setSelectedCampoId(row.id);
         }}
+        onUpdated={(row) => {
+          setCampos((prev) => prev.map((c) => (c.id === row.id ? row : c)));
+          setMapCenter([Number(row.lat), Number(row.lng)]);
+          setMapZoom(Number(row.zoom) || 14);
+        }}
+        fallbackMapCenter={mapCenter}
+        fallbackMapZoom={mapZoom}
       />
     </main>
   );
@@ -2161,10 +2863,51 @@ const styles = {
     display: "flex", alignItems: "center", gap: "10px",
     boxShadow: "0 2px 8px rgba(0, 0, 0, 0.06)", WebkitTapHighlightColor: "transparent",
   },
+  topCampoRow: {
+    flex: "1 1 auto",
+    minWidth: 0,
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    maxWidth: "min(440px, 58vw)",
+  },
   topCampoSelectWrap: {
     flex: "1 1 auto",
     minWidth: 0,
-    maxWidth: "min(320px, 42vw)",
+  },
+  topCampoGear: {
+    flexShrink: 0,
+    width: "38px",
+    height: "38px",
+    borderRadius: "10px",
+    border: "1px solid #cddcc8",
+    backgroundColor: "#f7faf5",
+    fontSize: "18px",
+    lineHeight: 1,
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 0,
+    WebkitTapHighlightColor: "transparent",
+  },
+  topCampoGearDisabled: {
+    opacity: 0.45,
+    cursor: "not-allowed",
+  },
+  topCampoNuevoBtn: {
+    flexShrink: 0,
+    height: "38px",
+    padding: "0 10px",
+    borderRadius: "10px",
+    border: "1px solid #cde5d2",
+    backgroundColor: "#eaf4eb",
+    color: "#1f3d28",
+    fontSize: "12px",
+    fontWeight: 800,
+    cursor: "pointer",
+    whiteSpace: "nowrap",
+    WebkitTapHighlightColor: "transparent",
   },
   campoSelect: {
     width: "100%",
@@ -2313,6 +3056,18 @@ const styles = {
     color: "#ffffff",
     fontSize: "16px",
     fontWeight: 800,
+    cursor: "pointer",
+    WebkitTapHighlightColor: "transparent",
+  },
+  primerCampoCancel: {
+    width: "100%",
+    height: "44px",
+    borderRadius: "12px",
+    border: "1px solid #cddcc8",
+    backgroundColor: "#f3f8f0",
+    color: "#355c3b",
+    fontSize: "15px",
+    fontWeight: 700,
     cursor: "pointer",
     WebkitTapHighlightColor: "transparent",
   },
@@ -2508,12 +3263,69 @@ const styles = {
     fontWeight: 600,
     color: "#5a7058",
   },
+  rotacionWarnAguada: {
+    flex: "1 0 100%",
+    fontSize: "12px",
+    fontWeight: 800,
+    color: "#9a5c1a",
+  },
   rotacionDisclaimer: {
     margin: "14px 0 0",
     fontSize: "11px",
     fontWeight: 600,
     color: "#7a8a76",
     lineHeight: 1.45,
+  },
+  listosBanner: {
+    flexShrink: 0,
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: "10px 12px",
+    padding: "10px 12px",
+    borderRadius: "14px",
+    border: "1px solid #e8c98a",
+    backgroundColor: "#fff8e6",
+    boxShadow: "0 2px 10px rgba(120, 90, 20, 0.08)",
+  },
+  listosBannerText: {
+    margin: 0,
+    flex: "1 1 200px",
+    fontSize: "14px",
+    fontWeight: 700,
+    color: "#5c4010",
+    lineHeight: 1.35,
+  },
+  listosBannerActions: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: "8px",
+    flexShrink: 0,
+  },
+  listosBannerBtn: {
+    height: "36px",
+    padding: "0 14px",
+    borderRadius: "10px",
+    border: "1px solid #d4a85c",
+    backgroundColor: "#ffffff",
+    color: "#5c4010",
+    fontSize: "13px",
+    fontWeight: 700,
+    cursor: "pointer",
+    WebkitTapHighlightColor: "transparent",
+  },
+  listosBannerDismiss: {
+    height: "36px",
+    padding: "0 12px",
+    borderRadius: "10px",
+    border: "none",
+    backgroundColor: "transparent",
+    color: "#7a6230",
+    fontSize: "13px",
+    fontWeight: 700,
+    cursor: "pointer",
+    textDecoration: "underline",
+    WebkitTapHighlightColor: "transparent",
   },
   listosSection: {
     flexShrink: 0,
@@ -2618,6 +3430,54 @@ const styles = {
     border: "none", backgroundColor: "#5f4b32", color: "#ffffff", fontSize: "16px", fontWeight: 700,
     boxShadow: "0 12px 22px rgba(45, 88, 40, 0.35)", cursor: "pointer", zIndex: 1000, pointerEvents: "auto",
   },
+  floatingStack: {
+    position: "absolute",
+    left: "50%",
+    bottom: "calc(14px + env(safe-area-inset-bottom, 0px))",
+    transform: "translateX(-50%)",
+    display: "flex",
+    flexDirection: "column",
+    gap: "10px",
+    width: "min(280px, 92vw)",
+    zIndex: 1000,
+    alignItems: "stretch",
+  },
+  floatingAguadaBtn: {
+    height: "48px",
+    borderRadius: "999px",
+    border: "none",
+    backgroundColor: "#1a6cad",
+    color: "#ffffff",
+    fontSize: "15px",
+    fontWeight: 700,
+    cursor: "pointer",
+    boxShadow: "0 10px 20px rgba(26, 108, 173, 0.35)",
+    WebkitTapHighlightColor: "transparent",
+  },
+  floatingStackPrimary: {
+    height: "48px",
+    borderRadius: "999px",
+    border: "none",
+    backgroundColor: "#3d7f49",
+    color: "#ffffff",
+    fontSize: "16px",
+    fontWeight: 700,
+    cursor: "pointer",
+    boxShadow: "0 12px 22px rgba(45, 88, 40, 0.35)",
+    WebkitTapHighlightColor: "transparent",
+  },
+  floatingStackCancel: {
+    height: "48px",
+    borderRadius: "999px",
+    border: "none",
+    backgroundColor: "#5f4b32",
+    color: "#ffffff",
+    fontSize: "16px",
+    fontWeight: 700,
+    cursor: "pointer",
+    boxShadow: "0 12px 22px rgba(45, 88, 40, 0.35)",
+    WebkitTapHighlightColor: "transparent",
+  },
   drawHint: {
     position: "absolute", left: "50%", bottom: "calc(72px + env(safe-area-inset-bottom, 0px))",
     transform: "translateX(-50%)", margin: 0, padding: "6px 12px", borderRadius: "999px",
@@ -2639,7 +3499,28 @@ const styles = {
   nameDialogInput: {
     width: "100%", boxSizing: "border-box", height: "44px", borderRadius: "12px",
     border: "1px solid #cddcc8", backgroundColor: "#f7faf5", padding: "0 12px",
-    fontSize: "15px", marginBottom: "16px",
+    fontSize: "15px", marginBottom: "10px",
+  },
+  nameDialogFieldLabel: {
+    display: "block",
+    fontSize: "12px",
+    fontWeight: 700,
+    color: "#4a6652",
+    marginBottom: "6px",
+  },
+  nameDialogSelect: {
+    width: "100%",
+    boxSizing: "border-box",
+    height: "44px",
+    borderRadius: "12px",
+    border: "1px solid #cddcc8",
+    backgroundColor: "#f7faf5",
+    padding: "0 10px",
+    fontSize: "15px",
+    fontWeight: 600,
+    color: "#2a3f2f",
+    marginBottom: "16px",
+    outline: "none",
   },
   nameDialogActions: { display: "flex", gap: "10px", justifyContent: "flex-end" },
   nameDialogSecondary: {
@@ -2674,6 +3555,30 @@ const styles = {
     border: "1px solid #eeeeee", backgroundColor: "#ffffff", color: "#355c3b",
     fontSize: "22px", lineHeight: 1, cursor: "pointer",
     display: "flex", alignItems: "center", justifyContent: "center", padding: 0,
+  },
+  sheetTabsRow: {
+    display: "flex",
+    gap: "8px",
+    flexShrink: 0,
+    paddingBottom: "6px",
+    borderBottom: "1px solid #edf2ec",
+  },
+  sheetTab: {
+    flex: 1,
+    height: "40px",
+    borderRadius: "10px",
+    border: "1px solid #dce7d6",
+    backgroundColor: "#f7faf5",
+    color: "#4a6652",
+    fontSize: "14px",
+    fontWeight: 700,
+    cursor: "pointer",
+    WebkitTapHighlightColor: "transparent",
+  },
+  sheetTabActive: {
+    borderColor: "#3d7f49",
+    backgroundColor: "#eaf4eb",
+    color: "#1f3d28",
   },
   sheetCards: {
     display: "flex",
@@ -2760,6 +3665,94 @@ const styles = {
     color: "#3d5c44",
     lineHeight: 1.35,
   },
+  sheetAguadaSelect: {
+    width: "100%",
+    minHeight: "44px",
+    borderRadius: "12px",
+    border: "1px solid #cddcc8",
+    backgroundColor: "#f7faf5",
+    padding: "0 10px",
+    fontSize: "15px",
+    fontWeight: 600,
+    color: "#2a3f2f",
+    outline: "none",
+    boxSizing: "border-box",
+  },
+  historialList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "8px",
+    flex: "1 1 auto",
+    minHeight: 0,
+    overflowY: "auto",
+    WebkitOverflowScrolling: "touch",
+    paddingBottom: "4px",
+  },
+  historialRow: {
+    display: "flex",
+    gap: "10px",
+    alignItems: "flex-start",
+    padding: "10px 10px",
+    borderRadius: "12px",
+    border: "1px solid #edf0ea",
+    backgroundColor: "#fbfcfa",
+  },
+  historialIcon: {
+    fontSize: "22px",
+    lineHeight: 1,
+    flexShrink: 0,
+  },
+  historialMain: {
+    flex: "1 1 auto",
+    minWidth: 0,
+  },
+  historialTipo: {
+    fontSize: "11px",
+    fontWeight: 800,
+    color: "#5a7058",
+    textTransform: "uppercase",
+    letterSpacing: "0.04em",
+  },
+  historialFecha: {
+    fontSize: "12px",
+    fontWeight: 600,
+    color: "#7a8a76",
+    marginTop: "2px",
+  },
+  historialDesc: {
+    fontSize: "14px",
+    fontWeight: 600,
+    color: "#1f3d28",
+    marginTop: "6px",
+    lineHeight: 1.35,
+  },
+  historialFotoNote: {
+    fontSize: "12px",
+    fontWeight: 600,
+    color: "#9a7030",
+    marginTop: "8px",
+    fontStyle: "italic",
+  },
+  historialEmpty: {
+    margin: 0,
+    padding: "12px 4px",
+    fontSize: "14px",
+    fontWeight: 600,
+    color: "#5a7058",
+    textAlign: "center",
+  },
+  aguadaPopupBtn: {
+    marginTop: "8px",
+    width: "100%",
+    height: "36px",
+    borderRadius: "8px",
+    border: "1px solid #c8d8e8",
+    backgroundColor: "#fff5f5",
+    color: "#8b2f2f",
+    fontSize: "13px",
+    fontWeight: 700,
+    cursor: "pointer",
+  },
   sheetError: {
     margin: 0,
     fontSize: "13px",
@@ -2835,6 +3828,38 @@ const styles = {
     padding: "0 12px",
     fontSize: "15px",
     marginBottom: "16px",
+  },
+  sheetNestedInputTight: {
+    width: "100%",
+    boxSizing: "border-box",
+    height: "44px",
+    borderRadius: "12px",
+    border: "1px solid #cddcc8",
+    backgroundColor: "#f7faf5",
+    padding: "0 12px",
+    fontSize: "15px",
+    marginBottom: "10px",
+  },
+  sheetNestedFieldLabel: {
+    display: "block",
+    fontSize: "12px",
+    fontWeight: 700,
+    color: "#4a6652",
+    marginBottom: "6px",
+  },
+  sheetNestedSelect: {
+    width: "100%",
+    boxSizing: "border-box",
+    height: "44px",
+    borderRadius: "12px",
+    border: "1px solid #cddcc8",
+    backgroundColor: "#f7faf5",
+    padding: "0 10px",
+    fontSize: "15px",
+    fontWeight: 600,
+    color: "#2a3f2f",
+    marginBottom: "16px",
+    outline: "none",
   },
   sheetNestedActions: {
     display: "flex",
