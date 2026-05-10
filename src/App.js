@@ -212,6 +212,60 @@ function MapViewSync({ center, zoom }) {
   return null;
 }
 
+/** Margen extra sobre el borde del visual viewport (Safari barra inferior / teclado). */
+const VISUAL_VIEWPORT_BOTTOM_BUFFER_PX = 12;
+
+/**
+ * Píxeles entre el borde inferior del layout viewport y el del visual viewport
+ * (teclado + chrome inferior en Safari móvil). Sumar al `bottom` de UI `position: fixed`.
+ */
+function useVisualViewportBottomInset() {
+  const [insetPx, setInsetPx] = useState(0);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const vv = window.visualViewport;
+    if (!vv) return undefined;
+
+    const compute = () => {
+      const layoutH = window.innerHeight;
+      // Borde inferior del visual viewport respecto al layout (Safari barra / teclado).
+      const visibleBottom = vv.offsetTop + vv.height;
+      const overlap = Math.max(0, layoutH - visibleBottom);
+      setInsetPx(Math.round(overlap + VISUAL_VIEWPORT_BOTTOM_BUFFER_PX));
+    };
+
+    compute();
+    vv.addEventListener("resize", compute);
+    vv.addEventListener("scroll", compute);
+    window.addEventListener("resize", compute);
+
+    return () => {
+      vv.removeEventListener("resize", compute);
+      vv.removeEventListener("scroll", compute);
+      window.removeEventListener("resize", compute);
+    };
+  }, []);
+
+  return insetPx;
+}
+
+function useMediaQuery(query) {
+  const [matches, setMatches] = useState(
+    () => typeof window !== "undefined" && window.matchMedia(query).matches,
+  );
+
+  useEffect(() => {
+    const mq = window.matchMedia(query);
+    const onChange = () => setMatches(mq.matches);
+    onChange();
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, [query]);
+
+  return matches;
+}
+
 const potreroStyle = {
   color: "#2f6a3a",
   weight: 2,
@@ -1204,6 +1258,25 @@ function MapaPotrero({ onLogout }) {
   const [campoEditModalOpen, setCampoEditModalOpen] = useState(false);
   const [mapCenter, setMapCenter] = useState(ARGENTINA_CENTER);
   const [mapZoom, setMapZoom] = useState(6);
+  const vvBottomInsetPx = useVisualViewportBottomInset();
+  const floatingBottomStyle = useMemo(
+    () => ({
+      bottom: `calc(14px + env(safe-area-inset-bottom, 0px) + ${vvBottomInsetPx}px)`,
+    }),
+    [vvBottomInsetPx],
+  );
+  const drawHintBottomStyle = useMemo(
+    () => ({
+      bottom: `calc(72px + env(safe-area-inset-bottom, 0px) + ${vvBottomInsetPx}px)`,
+    }),
+    [vvBottomInsetPx],
+  );
+  const drawHintAguadaBottomStyle = useMemo(
+    () => ({
+      bottom: `calc(76px + env(safe-area-inset-bottom, 0px) + ${vvBottomInsetPx}px)`,
+    }),
+    [vvBottomInsetPx],
+  );
   const [locationQuery, setLocationQuery] = useState("");
   const [locationSearchBusy, setLocationSearchBusy] = useState(false);
   const [locationSearchError, setLocationSearchError] = useState(null);
@@ -1566,6 +1639,16 @@ function MapaPotrero({ onLogout }) {
     setDraftVertices([]);
     setPreviewTip(null);
     setDrawingMode(true);
+  }, []);
+
+  const beginAguadaPlacement = useCallback(() => {
+    setDrawingMode(false);
+    setDraftVertices([]);
+    setPreviewTip(null);
+    setPendingRing(null);
+    setSelectedPotrero(null);
+    setSheetEntered(false);
+    setAguadaPlacementMode(true);
   }, []);
 
   const cancelDrawing = useCallback(() => {
@@ -1960,99 +2043,208 @@ function MapaPotrero({ onLogout }) {
     setCampoEditModalOpen(false);
   }, []);
 
+  const compactMapHeader = useMediaQuery("(max-width: 720px)");
+
+  const mapHeaderMenu = (
+    <div style={{ position: "relative" }}>
+      <button
+        type="button"
+        style={styles.menuButton}
+        aria-label="Abrir menu"
+        onClick={() => setMenuOpen((v) => !v)}
+      >
+        ☰
+      </button>
+      {menuOpen && (
+        <>
+          <div
+            style={styles.menuOverlay}
+            onClick={() => setMenuOpen(false)}
+          />
+          <div style={styles.menuDropdown}>
+            {selectedCampoId && !aguadaPlacementMode && (
+              <button
+                type="button"
+                style={styles.menuDropdownItem}
+                onClick={() => {
+                  setMenuOpen(false);
+                  beginAguadaPlacement();
+                }}
+              >
+                💧 Colocar aguadas
+              </button>
+            )}
+            <button
+              type="button"
+              style={styles.menuDropdownItem}
+              onClick={() => { setMenuOpen(false); onLogout(); }}
+            >
+              Cerrar sesión
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+
   return (
     <main style={styles.mapPage}>
-      <header className="rotia-map-header" style={styles.topBar}>
-        <div style={styles.topBrand}>
-          <div style={styles.topLogo} aria-hidden="true">🌿</div>
-          <strong style={styles.topTitle}>Rotia</strong>
-        </div>
-        {campos.length > 0 && (
-          <div style={styles.topCampoRow}>
-            <div style={styles.topCampoSelectWrap}>
-              <select
-                aria-label="Campo activo"
-                style={styles.campoSelect}
-                value={selectedCampoId ?? ""}
-                onChange={(e) => setSelectedCampoId(e.target.value)}
-              >
-                {campos.map((c) => (
-                  <option key={c.id} value={c.id}>{c.name}</option>
-                ))}
-              </select>
-            </div>
-            <button
-              type="button"
-              aria-label="Editar nombre y ubicación del campo"
-              title="Editar campo"
-              style={{
-                ...styles.topCampoGear,
-                ...(!selectedCampoId ? styles.topCampoGearDisabled : {}),
-              }}
-              disabled={!selectedCampoId}
-              onClick={() => {
-                setMenuOpen(false);
-                setCampoNuevoModalOpen(false);
-                setCampoEditModalOpen(true);
-              }}
-            >
-              ⚙️
-            </button>
-            <button
-              type="button"
-              style={styles.topCampoNuevoBtn}
-              onClick={() => {
-                setMenuOpen(false);
-                setCampoEditModalOpen(false);
-                setCampoNuevoModalOpen(true);
-              }}
-            >
-              Nuevo campo
-            </button>
-          </div>
-        )}
-        <div style={{ ...styles.topBarActions, marginLeft: "auto" }}>
-          <button
-            type="button"
-            style={{
-              ...styles.rotacionHeaderBtn,
-              opacity: selectedCampoId ? 1 : 0.45,
-              cursor: selectedCampoId ? "pointer" : "not-allowed",
-            }}
-            disabled={!selectedCampoId}
-            onClick={() => {
-              setMenuOpen(false);
-              if (!selectedCampoId) return;
-              setShowRotacionModal(true);
-            }}
-          >
-            Rotación
-          </button>
-          <div style={{ position: "relative" }}>
-          <button
-            style={styles.menuButton}
-            aria-label="Abrir menu"
-            onClick={() => setMenuOpen((v) => !v)}
-          >☰</button>
-          {menuOpen && (
-            <>
-              <div
-                style={styles.menuOverlay}
-                onClick={() => setMenuOpen(false)}
-              />
-              <div style={styles.menuDropdown}>
+      <header
+        className="rotia-map-header"
+        style={{
+          ...styles.topBar,
+          ...(compactMapHeader ? styles.topBarCompact : {}),
+        }}
+      >
+        {compactMapHeader ? (
+          <>
+            <div style={styles.topBarMobileRow1}>
+              <div style={styles.topBrand}>
+                <div style={styles.topLogo} aria-hidden="true">🌿</div>
+                <strong style={styles.topTitle}>Rotia</strong>
+              </div>
+              <div style={styles.topBarActionsIcons}>
+                {campos.length > 0 && (
+                  <>
+                    <button
+                      type="button"
+                      aria-label="Editar nombre y ubicación del campo"
+                      title="Editar campo"
+                      style={{
+                        ...styles.headerIconBtn,
+                        ...(!selectedCampoId ? styles.topCampoGearDisabled : {}),
+                      }}
+                      disabled={!selectedCampoId}
+                      onClick={() => {
+                        setMenuOpen(false);
+                        setCampoNuevoModalOpen(false);
+                        setCampoEditModalOpen(true);
+                      }}
+                    >
+                      ⚙️
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Nuevo campo"
+                      title="Nuevo campo"
+                      style={styles.headerIconBtn}
+                      onClick={() => {
+                        setMenuOpen(false);
+                        setCampoEditModalOpen(false);
+                        setCampoNuevoModalOpen(true);
+                      }}
+                    >
+                      ➕
+                    </button>
+                  </>
+                )}
                 <button
                   type="button"
-                  style={styles.menuDropdownItem}
-                  onClick={() => { setMenuOpen(false); onLogout(); }}
+                  aria-label="Rotación de potreros"
+                  title="Rotación"
+                  style={{
+                    ...styles.headerIconBtn,
+                    opacity: selectedCampoId ? 1 : 0.45,
+                    cursor: selectedCampoId ? "pointer" : "not-allowed",
+                  }}
+                  disabled={!selectedCampoId}
+                  onClick={() => {
+                    setMenuOpen(false);
+                    if (!selectedCampoId) return;
+                    setShowRotacionModal(true);
+                  }}
                 >
-                  Cerrar sesión
+                  🔄
+                </button>
+                {mapHeaderMenu}
+              </div>
+            </div>
+            {campos.length > 0 && (
+              <div style={styles.topCampoFullRow}>
+                <select
+                  aria-label="Campo activo"
+                  style={styles.campoSelect}
+                  value={selectedCampoId ?? ""}
+                  onChange={(e) => setSelectedCampoId(e.target.value)}
+                >
+                  {campos.map((c) => (
+                    <option key={c.id} value={c.id}>{c.name}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+          </>
+        ) : (
+          <>
+            <div style={styles.topBrand}>
+              <div style={styles.topLogo} aria-hidden="true">🌿</div>
+              <strong style={styles.topTitle}>Rotia</strong>
+            </div>
+            {campos.length > 0 && (
+              <div style={styles.topCampoRow}>
+                <div style={styles.topCampoSelectWrap}>
+                  <select
+                    aria-label="Campo activo"
+                    style={styles.campoSelect}
+                    value={selectedCampoId ?? ""}
+                    onChange={(e) => setSelectedCampoId(e.target.value)}
+                  >
+                    {campos.map((c) => (
+                      <option key={c.id} value={c.id}>{c.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <button
+                  type="button"
+                  aria-label="Editar nombre y ubicación del campo"
+                  title="Editar campo"
+                  style={{
+                    ...styles.topCampoGear,
+                    ...(!selectedCampoId ? styles.topCampoGearDisabled : {}),
+                  }}
+                  disabled={!selectedCampoId}
+                  onClick={() => {
+                    setMenuOpen(false);
+                    setCampoNuevoModalOpen(false);
+                    setCampoEditModalOpen(true);
+                  }}
+                >
+                  ⚙️
+                </button>
+                <button
+                  type="button"
+                  style={styles.topCampoNuevoBtn}
+                  onClick={() => {
+                    setMenuOpen(false);
+                    setCampoEditModalOpen(false);
+                    setCampoNuevoModalOpen(true);
+                  }}
+                >
+                  Nuevo campo
                 </button>
               </div>
-            </>
-          )}
-          </div>
-        </div>
+            )}
+            <div style={{ ...styles.topBarActions, marginLeft: "auto" }}>
+              <button
+                type="button"
+                style={{
+                  ...styles.rotacionHeaderBtn,
+                  opacity: selectedCampoId ? 1 : 0.45,
+                  cursor: selectedCampoId ? "pointer" : "not-allowed",
+                }}
+                disabled={!selectedCampoId}
+                onClick={() => {
+                  setMenuOpen(false);
+                  if (!selectedCampoId) return;
+                  setShowRotacionModal(true);
+                }}
+              >
+                Rotación
+              </button>
+              {mapHeaderMenu}
+            </div>
+          </>
+        )}
       </header>
 
       {showListosBanner && (
@@ -2269,7 +2461,7 @@ function MapaPotrero({ onLogout }) {
 
             {!pendingRing && selectedCampoId && (
               aguadaPlacementMode ? (
-                <div style={styles.floatingStack}>
+                <div style={{ ...styles.floatingStack, ...floatingBottomStyle }}>
                   <button
                     type="button"
                     style={styles.floatingStackCancel}
@@ -2279,41 +2471,32 @@ function MapaPotrero({ onLogout }) {
                   </button>
                 </div>
               ) : !drawingMode ? (
-                <div style={styles.floatingStack}>
-                  <button
-                    type="button"
-                    style={styles.floatingAguadaBtn}
-                    onClick={() => {
-                      setDrawingMode(false);
-                      setDraftVertices([]);
-                      setPreviewTip(null);
-                      setPendingRing(null);
-                      setSelectedPotrero(null);
-                      setSheetEntered(false);
-                      setAguadaPlacementMode(true);
-                    }}
-                  >
-                    💧 Colocar aguadas
-                  </button>
+                <div style={{ ...styles.floatingStack, ...floatingBottomStyle }}>
                   <button type="button" style={styles.floatingStackPrimary} onClick={startDrawing}>
                     + Agregar potrero
                   </button>
                 </div>
               ) : (
-                <button type="button" style={styles.floatingButtonCancel} onClick={cancelDrawing}>
+                <button
+                  type="button"
+                  style={{ ...styles.floatingButtonCancel, ...floatingBottomStyle }}
+                  onClick={cancelDrawing}
+                >
                   Cancelar dibujo
                 </button>
               )
             )}
 
             {drawingMode && !aguadaPlacementMode && (
-              <p style={styles.drawHint}>Doble click para cerrar el potrero</p>
+              <p style={{ ...styles.drawHint, ...drawHintBottomStyle }}>
+                Doble click para cerrar el potrero
+              </p>
             )}
             {aguadaPlacementMode && (
               <p
                 style={{
                   ...styles.drawHint,
-                  bottom: "calc(76px + env(safe-area-inset-bottom, 0px))",
+                  ...drawHintAguadaBottomStyle,
                   backgroundColor: "rgba(232, 244, 255, 0.95)",
                   color: "#1a4a6e",
                 }}
@@ -2496,7 +2679,7 @@ function MapaPotrero({ onLogout }) {
                 </select>
                 {aguadas.length === 0 && (
                   <p style={{ ...styles.sheetRecoHint, marginTop: "8px" }}>
-                    No hay aguadas en el mapa. Usá “💧 Colocar aguadas” y tocá el mapa.
+                    No hay aguadas en el mapa. Menú (☰) → “💧 Colocar aguadas” y tocá el mapa.
                   </p>
                 )}
               </div>
@@ -2862,6 +3045,49 @@ const styles = {
     border: "none", borderRadius: "14px", padding: "0 12px",
     display: "flex", alignItems: "center", gap: "10px",
     boxShadow: "0 2px 8px rgba(0, 0, 0, 0.06)", WebkitTapHighlightColor: "transparent",
+  },
+  topBarCompact: {
+    height: "auto",
+    minHeight: "52px",
+    flexDirection: "column",
+    alignItems: "stretch",
+    paddingTop: "8px",
+    paddingBottom: "8px",
+    gap: "8px",
+  },
+  topBarMobileRow1: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    width: "100%",
+    minHeight: "40px",
+    gap: "8px",
+  },
+  topBarActionsIcons: {
+    display: "flex",
+    alignItems: "center",
+    gap: "4px",
+    flexShrink: 0,
+  },
+  topCampoFullRow: {
+    width: "100%",
+    minWidth: 0,
+  },
+  headerIconBtn: {
+    width: "40px",
+    height: "40px",
+    borderRadius: "10px",
+    border: "1px solid #cde5d2",
+    backgroundColor: "#eaf4eb",
+    color: "#1f3d28",
+    fontSize: "18px",
+    lineHeight: 1,
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 0,
+    WebkitTapHighlightColor: "transparent",
   },
   topCampoRow: {
     flex: "1 1 auto",
@@ -3422,13 +3648,13 @@ const styles = {
     position: "absolute", left: "50%", bottom: "calc(14px + env(safe-area-inset-bottom, 0px))",
     transform: "translateX(-50%)", minWidth: "230px", height: "48px", borderRadius: "999px",
     border: "none", backgroundColor: "#3d7f49", color: "#ffffff", fontSize: "16px", fontWeight: 700,
-    boxShadow: "0 12px 22px rgba(45, 88, 40, 0.35)", cursor: "pointer", zIndex: 1000, pointerEvents: "auto",
+    boxShadow: "0 12px 22px rgba(45, 88, 40, 0.35)", cursor: "pointer", zIndex: 10050, pointerEvents: "auto",
   },
   floatingButtonCancel: {
     position: "absolute", left: "50%", bottom: "calc(14px + env(safe-area-inset-bottom, 0px))",
     transform: "translateX(-50%)", minWidth: "230px", height: "48px", borderRadius: "999px",
     border: "none", backgroundColor: "#5f4b32", color: "#ffffff", fontSize: "16px", fontWeight: 700,
-    boxShadow: "0 12px 22px rgba(45, 88, 40, 0.35)", cursor: "pointer", zIndex: 1000, pointerEvents: "auto",
+    boxShadow: "0 12px 22px rgba(45, 88, 40, 0.35)", cursor: "pointer", zIndex: 10050, pointerEvents: "auto",
   },
   floatingStack: {
     position: "absolute",
@@ -3439,20 +3665,8 @@ const styles = {
     flexDirection: "column",
     gap: "10px",
     width: "min(280px, 92vw)",
-    zIndex: 1000,
+    zIndex: 10050,
     alignItems: "stretch",
-  },
-  floatingAguadaBtn: {
-    height: "48px",
-    borderRadius: "999px",
-    border: "none",
-    backgroundColor: "#1a6cad",
-    color: "#ffffff",
-    fontSize: "15px",
-    fontWeight: 700,
-    cursor: "pointer",
-    boxShadow: "0 10px 20px rgba(26, 108, 173, 0.35)",
-    WebkitTapHighlightColor: "transparent",
   },
   floatingStackPrimary: {
     height: "48px",
@@ -3482,7 +3696,7 @@ const styles = {
     position: "absolute", left: "50%", bottom: "calc(72px + env(safe-area-inset-bottom, 0px))",
     transform: "translateX(-50%)", margin: 0, padding: "6px 12px", borderRadius: "999px",
     backgroundColor: "rgba(244, 250, 240, 0.92)", color: "#2a3f2f", fontSize: "13px", fontWeight: 600,
-    boxShadow: "0 8px 16px rgba(47, 84, 42, 0.12)", zIndex: 1000, pointerEvents: "none", whiteSpace: "nowrap",
+    boxShadow: "0 8px 16px rgba(47, 84, 42, 0.12)", zIndex: 10040, pointerEvents: "none", whiteSpace: "nowrap",
   },
   nameDialogBackdrop: {
     position: "fixed", inset: 0, border: "none", padding: "16px", margin: 0,
