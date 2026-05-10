@@ -46,6 +46,16 @@ function evaluatePixel(samples) {
 
 type Ring = [number, number][];
 
+/** Área aproximada del bbox en m² (estimación rápida) */
+function bboxAreaM2(positions: Ring): number {
+  const lats = positions.map((p) => p[0]);
+  const lngs = positions.map((p) => p[1]);
+  const dLat = (Math.max(...lats) - Math.min(...lats)) * 111320;
+  const dLng = (Math.max(...lngs) - Math.min(...lngs)) * 111320 *
+    Math.cos((((Math.max(...lats) + Math.min(...lats)) / 2) * Math.PI) / 180);
+  return dLat * dLng;
+}
+
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -112,12 +122,14 @@ type StatsInterval = {
   };
 };
 
-function pickLatestNdviInterval(data: StatsInterval[]): {
+function pickLatestNdviInterval(
+  data: StatsInterval[],
+  minSamples: number,
+): {
   mean: number;
   intervalFrom: string;
   intervalTo: string;
 } | null {
-  const minSamples = 8;
   for (let i = data.length - 1; i >= 0; i--) {
     const row = data[i];
     const mean = row.outputs?.data?.bands?.B0?.stats?.mean;
@@ -133,6 +145,26 @@ function pickLatestNdviInterval(data: StatsInterval[]): {
     }
   }
   return null;
+}
+
+function buildNdviHistory(
+  data: StatsInterval[],
+  maxDays: number,
+  minSamples: number,
+): Array<{ date: string; mean: number }> {
+  const cutoff = new Date();
+  cutoff.setUTCDate(cutoff.getUTCDate() - maxDays);
+  const points: Array<{ date: string; mean: number }> = [];
+  for (const row of data) {
+    const to = row.interval?.to;
+    if (!to) continue;
+    if (new Date(to) < cutoff) continue;
+    const mean = row.outputs?.data?.bands?.B0?.stats?.mean;
+    const n = row.outputs?.data?.bands?.B0?.stats?.sampleCount ?? 0;
+    if (typeof mean !== "number" || !Number.isFinite(mean) || n < minSamples) continue;
+    points.push({ date: to.slice(0, 10), mean: Math.min(1, Math.max(0, mean)) });
+  }
+  return points.sort((a, b) => a.date.localeCompare(b.date));
 }
 
 Deno.serve(async (req) => {
@@ -180,9 +212,19 @@ Deno.serve(async (req) => {
 
     const geometry = ringToGeoJsonPolygon(ring);
 
-    const to = new Date();
-    const from = new Date(to);
-    from.setUTCDate(from.getUTCDate() - 120);
+    const areaM2 = bboxAreaM2(ring);
+    // Para polígonos chicos (< 1 ha) aceptar 1 píxel.
+    // Para polígonos grandes (> 8 ha) exigir hasta 8 píxeles.
+    // Escala lineal entre 1 y 8 según área.
+    const MIN_SAMPLE_COUNT = areaM2 < 10_000
+      ? 1
+      : areaM2 < 80_000
+        ? Math.max(1, Math.floor(areaM2 / 10_000))
+        : 8;
+
+    const windowDays = areaM2 < 50000 ? 180 : 120;
+    const dateTo = new Date();
+    const dateFrom = new Date(dateTo.getTime() - windowDays * 24 * 60 * 60 * 1000);
 
     const statsPayload = {
       input: {
@@ -203,8 +245,8 @@ Deno.serve(async (req) => {
       },
       aggregation: {
         timeRange: {
-          from: from.toISOString(),
-          to: to.toISOString(),
+          from: dateFrom.toISOString(),
+          to: dateTo.toISOString(),
         },
         aggregationInterval: { of: "P10D" },
         evalscript: NDVI_EVALSCRIPT,
@@ -251,7 +293,7 @@ Deno.serve(async (req) => {
       }, 502);
     }
 
-    const picked = pickLatestNdviInterval(shJson.data);
+    const picked = pickLatestNdviInterval(shJson.data, MIN_SAMPLE_COUNT);
     if (!picked) {
       return jsonResponse({
         ok: false,
@@ -264,6 +306,7 @@ Deno.serve(async (req) => {
       meanNdvi: picked.mean,
       intervalFrom: picked.intervalFrom,
       intervalTo: picked.intervalTo,
+      history: buildNdviHistory(shJson.data, 90, MIN_SAMPLE_COUNT),
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : "UNKNOWN";

@@ -9,7 +9,7 @@ export function ndviTier(mean) {
 
 /**
  * @param {number[][]} positions Leaflet ring [lat, lng][]
- * @returns {Promise<{ ok: boolean, meanNdvi?: number, intervalTo?: string, error?: string }>}
+ * @returns {Promise<{ ok: boolean, meanNdvi?: number, intervalTo?: string, history?: Array<{date: string, mean: number}>, error?: string }>}
  */
 export async function fetchPotreroNdvi(positions) {
   const { data, error } = await supabase.functions.invoke("ndvi", {
